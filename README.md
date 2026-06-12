@@ -60,13 +60,13 @@ apt install -y iproute2 iptables curl
 Download and run:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/gre-manager.sh)
+bash <(curl -fsSL https://github.com/Hasan-Torabi/gre-manager/blob/main/gre-manager
 ```
 
 Or install manually:
 
 ```bash
-wget https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/gre-manager.sh -O /root/gre-manager.sh
+wget https://github.com/Hasan-Torabi/gre-manager/blob/main/gre-manager -O /root/gre-manager.sh
 chmod +x /root/gre-manager.sh
 bash /root/gre-manager.sh
 ```
