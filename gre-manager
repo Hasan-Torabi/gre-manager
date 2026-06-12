@@ -1,0 +1,1131 @@
+#!/usr/bin/env bash
+# GRE Tunnel Manager
+# Purpose: Manage, discover, import, test, and maintain multiple GRE tunnels on Linux VPS servers.
+
+set -u
+
+APP_NAME="GRE Tunnel Manager"
+APP_VERSION="1.1.0"
+INSTALL_PATH="/usr/local/bin/gre-manager"
+CONFIG_DIR="/etc/gre-manager/tunnels"
+LOG_DIR="/var/log/gre-manager"
+SERVICE_PREFIX="gre-manager"
+DEFAULT_MTU="1300"
+DEFAULT_TEST_SUBNET_PREFIX="10.254.254"
+DEFAULT_TEST_KEY="654321"
+DEFAULT_WATCHDOG_INTERVAL="3min"
+
+# ---------- Basic helpers ----------
+
+is_root() { [ "${EUID:-$(id -u)}" -eq 0 ]; }
+
+require_root() {
+  if ! is_root; then
+    echo "ERROR: Please run as root. Example: sudo $0"
+    exit 1
+  fi
+}
+
+pause() { echo; read -r -p "Press Enter to continue..." _; }
+
+hr() { printf '%*s\n' "${COLUMNS:-80}" '' | tr ' ' '-'; }
+msg() { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+err() { echo "[ERROR] $*" >&2; }
+
+confirm() {
+  local prompt="${1:-Are you sure?}" default="${2:-n}" ans suffix
+  if [[ "$default" =~ ^[Yy]$ ]]; then suffix="Y/n"; else suffix="y/N"; fi
+  read -r -p "$prompt [$suffix]: " ans
+  ans="${ans:-$default}"
+  [[ "$ans" =~ ^[Yy]$|^[Yy][Ee][Ss]$ ]]
+}
+
+safe_name() { [[ "${1:-}" =~ ^[A-Za-z0-9_.-]{1,15}$ ]]; }
+
+valid_ipv4() {
+  local ip="${1:-}" IFS=. o x
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  read -r -a o <<< "$ip"
+  [ "${#o[@]}" -eq 4 ] || return 1
+  for x in "${o[@]}"; do
+    [[ "$x" =~ ^[0-9]+$ ]] || return 1
+    [ "$x" -ge 0 ] && [ "$x" -le 255 ] || return 1
+  done
+  return 0
+}
+
+valid_ipv4_cidr() {
+  local v="${1:-}" ip cidr
+  [[ "$v" =~ ^([^/]+)/([0-9]{1,2})$ ]] || return 1
+  ip="${BASH_REMATCH[1]}"; cidr="${BASH_REMATCH[2]}"
+  valid_ipv4 "$ip" || return 1
+  [ "$cidr" -ge 1 ] && [ "$cidr" -le 32 ]
+}
+
+valid_key() {
+  local k="${1:-}"
+  [[ "$k" =~ ^[0-9]+$ ]] || return 1
+  [ "$k" -ge 0 ] && [ "$k" -le 4294967295 ]
+}
+
+valid_mtu() {
+  local m="${1:-}"
+  [[ "$m" =~ ^[0-9]+$ ]] || return 1
+  [ "$m" -ge 576 ] && [ "$m" -le 1476 ]
+}
+
+ip_to_int() { local ip="$1" a b c d; IFS=. read -r a b c d <<< "$ip"; echo $(( (a << 24) + (b << 16) + (c << 8) + d )); }
+cidr_to_ip() { echo "${1%/*}"; }
+
+peer_from_30() {
+  local cidr="$1" ip last base
+  ip="${cidr%/*}"
+  [[ "$cidr" =~ /30$ ]] || return 1
+  base="${ip%.*}"; last="${ip##*.}"
+  case "$last" in
+    1) echo "$base.2"; return 0 ;;
+    2) echo "$base.1"; return 0 ;;
+    5) echo "$base.6"; return 0 ;;
+    6) echo "$base.5"; return 0 ;;
+    9) echo "$base.10"; return 0 ;;
+    10) echo "$base.9"; return 0 ;;
+    13) echo "$base.14"; return 0 ;;
+    14) echo "$base.13"; return 0 ;;
+  esac
+  return 1
+}
+
+ensure_dirs() {
+  mkdir -p "$CONFIG_DIR" "$LOG_DIR" /etc/gre-manager
+  chmod 700 /etc/gre-manager 2>/dev/null || true
+  chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+}
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------- IP detection ----------
+
+list_local_global_ips() { ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u; }
+
+get_public_ip_by_web() {
+  local ip="" svc
+  command_exists curl || return 1
+  for svc in https://api.ipify.org https://ifconfig.me https://icanhazip.com https://checkip.amazonaws.com; do
+    ip=$(curl -4 -fsS --max-time 3 "$svc" 2>/dev/null | tr -d '[:space:]' || true)
+    valid_ipv4 "$ip" && { echo "$ip"; return 0; }
+  done
+  return 1
+}
+
+get_route_src_ip() {
+  local target="${1:-1.1.1.1}" ipaddr=""
+  ipaddr=$(ip route get "$target" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true)
+  valid_ipv4 "$ipaddr" && { echo "$ipaddr"; return 0; }
+  return 1
+}
+
+ask_ipv4() {
+  local prompt="$1" default="${2:-}" value
+  while true; do
+    if [ -n "$default" ]; then read -r -p "$prompt [$default]: " value; value="${value:-$default}"; else read -r -p "$prompt: " value; fi
+    if valid_ipv4 "$value"; then echo "$value"; return 0; fi
+    echo "Invalid IPv4 address. Example: 194.32.213.30"
+  done
+}
+
+ask_ipv4_cidr() {
+  local prompt="$1" default="${2:-}" value
+  while true; do
+    if [ -n "$default" ]; then read -r -p "$prompt [$default]: " value; value="${value:-$default}"; else read -r -p "$prompt: " value; fi
+    if valid_ipv4_cidr "$value"; then echo "$value"; return 0; fi
+    echo "Invalid CIDR. Example: 10.80.0.2/30"
+  done
+}
+
+ask_number() {
+  local prompt="$1" default="${2:-}" value
+  while true; do
+    if [ -n "$default" ]; then read -r -p "$prompt [$default]: " value; value="${value:-$default}"; else read -r -p "$prompt: " value; fi
+    [[ "$value" =~ ^[0-9]+$ ]] && { echo "$value"; return 0; }
+    echo "Please enter a number."
+  done
+}
+
+ask_local_public_ip() {
+  local peer="${1:-}" detected="" value count choice
+  local -a ips
+
+  [ -n "$peer" ] && detected=$(get_route_src_ip "$peer" || true)
+  [ -z "$detected" ] && detected=$(get_public_ip_by_web || true)
+  [ -z "$detected" ] && detected=$(get_route_src_ip "1.1.1.1" || true)
+
+  mapfile -t ips < <(list_local_global_ips)
+  count="${#ips[@]}"
+
+  echo
+  echo "Local IP detection:"
+  [ -n "$detected" ] && echo "  Detected candidate: $detected" || echo "  Detected candidate: not found"
+  if [ "$count" -gt 0 ]; then
+    echo "  Local interface IPv4 addresses:"
+    local i=1
+    for value in "${ips[@]}"; do echo "    $i) $value"; i=$((i+1)); done
+  fi
+
+  if [ -n "$detected" ] && confirm "Use $detected as this server public IP?" "y"; then echo "$detected"; return 0; fi
+
+  if [ "$count" -gt 1 ]; then
+    while true; do
+      read -r -p "Choose local IP number or press Enter to type manually: " choice
+      [ -z "$choice" ] && break
+      if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then echo "${ips[$((choice-1))]}"; return 0; fi
+      echo "Invalid choice."
+    done
+  elif [ "$count" -eq 1 ]; then
+    if confirm "Use ${ips[0]} as this server public IP?" "y"; then echo "${ips[0]}"; return 0; fi
+  fi
+  ask_ipv4 "Enter this server public IP"
+}
+
+# ---------- Config handling ----------
+
+config_file() { echo "$CONFIG_DIR/$1.conf"; }
+service_name() { echo "$SERVICE_PREFIX-$1.service"; }
+watchdog_service_name() { echo "$SERVICE_PREFIX-$1-watchdog.service"; }
+watchdog_timer_name() { echo "$SERVICE_PREFIX-$1-watchdog.timer"; }
+
+load_config() {
+  local name="$1" file
+  file=$(config_file "$name")
+  if [ ! -f "$file" ]; then err "Tunnel config not found: $file"; return 1; fi
+  # shellcheck disable=SC1090
+  source "$file"
+}
+
+write_config() {
+  local name="$1" file
+  file=$(config_file "$name")
+  umask 077
+  cat > "$file" <<EOF2
+# Managed by GRE Tunnel Manager. Do not edit unless you know what you are doing.
+TUN_NAME=$(printf '%q' "$TUN_NAME")
+ROLE=$(printf '%q' "$ROLE")
+LOCAL_PUBLIC=$(printf '%q' "$LOCAL_PUBLIC")
+REMOTE_PUBLIC=$(printf '%q' "$REMOTE_PUBLIC")
+GRE_KEY=$(printf '%q' "$GRE_KEY")
+LOCAL_TUN_IP_CIDR=$(printf '%q' "$LOCAL_TUN_IP_CIDR")
+REMOTE_TUN_IP=$(printf '%q' "$REMOTE_TUN_IP")
+MTU=$(printf '%q' "$MTU")
+MSS_CLAMP=$(printf '%q' "$MSS_CLAMP")
+DISABLE_RPFILTER=$(printf '%q' "$DISABLE_RPFILTER")
+WATCHDOG_ENABLED=$(printf '%q' "$WATCHDOG_ENABLED")
+TEST_PORTS=$(printf '%q' "$TEST_PORTS")
+EOF2
+}
+
+list_managed_tunnels() { ensure_dirs; find "$CONFIG_DIR" -maxdepth 1 -type f -name '*.conf' 2>/dev/null | sed 's#.*/##; s#\.conf$##' | sort; }
+
+# ---------- iptables helpers ----------
+
+iptables_add_once() {
+  command_exists iptables || { warn "iptables command not found. Skipping rule."; return 0; }
+  local table="$1" chain="$2"; shift 2
+  iptables -t "$table" -C "$chain" "$@" >/dev/null 2>&1 || iptables -t "$table" -A "$chain" "$@"
+}
+
+iptables_insert_once() {
+  command_exists iptables || { warn "iptables command not found. Skipping rule."; return 0; }
+  local table="$1" chain="$2"; shift 2
+  iptables -t "$table" -C "$chain" "$@" >/dev/null 2>&1 || iptables -t "$table" -I "$chain" "$@"
+}
+
+iptables_delete_all() {
+  command_exists iptables || return 0
+  local table="$1" chain="$2"; shift 2
+  while iptables -t "$table" -C "$chain" "$@" >/dev/null 2>&1; do iptables -t "$table" -D "$chain" "$@" >/dev/null 2>&1 || break; done
+}
+
+save_firewall_if_possible() {
+  if command_exists netfilter-persistent; then netfilter-persistent save >/dev/null 2>&1 || true; fi
+}
+
+add_gre_firewall_rules() {
+  local tun="$1" peer="$2"
+  [ -n "$peer" ] || return 0
+  iptables_insert_once filter INPUT -p gre -s "$peer" -m comment --comment "gre-manager:$tun" -j ACCEPT || true
+  iptables_insert_once filter OUTPUT -p gre -d "$peer" -m comment --comment "gre-manager:$tun" -j ACCEPT || true
+}
+
+remove_gre_firewall_rules() {
+  local tun="$1" peer="$2"
+  [ -n "$peer" ] || return 0
+  iptables_delete_all filter INPUT -p gre -s "$peer" -m comment --comment "gre-manager:$tun" -j ACCEPT || true
+  iptables_delete_all filter OUTPUT -p gre -d "$peer" -m comment --comment "gre-manager:$tun" -j ACCEPT || true
+}
+
+apply_mss_clamp_rules() {
+  local tun="$1"
+  iptables_add_once mangle FORWARD -o "$tun" -p tcp --tcp-flags SYN,RST SYN -m comment --comment "gre-manager:$tun:mss-forward-out" -j TCPMSS --clamp-mss-to-pmtu || true
+  iptables_add_once mangle FORWARD -i "$tun" -p tcp --tcp-flags SYN,RST SYN -m comment --comment "gre-manager:$tun:mss-forward-in" -j TCPMSS --clamp-mss-to-pmtu || true
+  iptables_add_once mangle OUTPUT -o "$tun" -p tcp --tcp-flags SYN,RST SYN -m comment --comment "gre-manager:$tun:mss-output" -j TCPMSS --clamp-mss-to-pmtu || true
+}
+
+remove_mss_clamp_rules() {
+  local tun="$1"
+  iptables_delete_all mangle FORWARD -o "$tun" -p tcp --tcp-flags SYN,RST SYN -m comment --comment "gre-manager:$tun:mss-forward-out" -j TCPMSS --clamp-mss-to-pmtu || true
+  iptables_delete_all mangle FORWARD -i "$tun" -p tcp --tcp-flags SYN,RST SYN -m comment --comment "gre-manager:$tun:mss-forward-in" -j TCPMSS --clamp-mss-to-pmtu || true
+  iptables_delete_all mangle OUTPUT -o "$tun" -p tcp --tcp-flags SYN,RST SYN -m comment --comment "gre-manager:$tun:mss-output" -j TCPMSS --clamp-mss-to-pmtu || true
+  iptables_delete_all mangle FORWARD -o "$tun" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
+  iptables_delete_all mangle FORWARD -i "$tun" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
+  iptables_delete_all mangle OUTPUT -o "$tun" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
+}
+
+show_mss_rules() {
+  if ! command_exists iptables; then echo "iptables not found."; return 0; fi
+  echo "Current TCPMSS rules:"
+  iptables -t mangle -S 2>/dev/null | grep -E 'TCPMSS|gre-manager' || echo "No TCPMSS rules found."
+}
+
+mss_status_for_if() {
+  local tun="$1" c=0
+  command_exists iptables || { echo "iptables-missing"; return; }
+  iptables -t mangle -S 2>/dev/null | grep -E -- "TCPMSS" | grep -Eq -- "(-o $tun|-i $tun)" && c=1 || true
+  [ "$c" -eq 1 ] && echo "enabled" || echo "not-found"
+}
+
+# ---------- Discovery helpers ----------
+
+get_systemd_state() { systemctl is-active "$1" 2>/dev/null || echo "unknown"; }
+get_systemd_enabled() { systemctl is-enabled "$1" 2>/dev/null || echo "unknown"; }
+
+extract_var_from_file() {
+  local file="$1" var="$2" line val
+  [ -f "$file" ] || return 1
+  line=$(grep -E "^[[:space:]]*(readonly[[:space:]]+)?${var}=" "$file" 2>/dev/null | tail -1 || true)
+  [ -n "$line" ] || return 1
+  val="${line#*=}"
+  val="${val%%#*}"
+  val="$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+  [ -n "$val" ] || return 1
+  echo "$val"
+}
+
+expand_vars_from_script() {
+  local file="$1" text="$2" vars var val
+  vars=$(grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' <<< "$text" | sed -e 's/^\$//' -e 's/[{}]//g' | sort -u || true)
+  for var in $vars; do
+    val=$(extract_var_from_file "$file" "$var" || true)
+    [ -n "$val" ] || continue
+    text="${text//\$\{$var\}/$val}"
+    text="${text//\$$var/$val}"
+  done
+  echo "$text"
+}
+
+parse_ip_tunnel_line() {
+  local line="$1" field next tun local_ip remote_ip key ttl
+  tun="${line%%:*}"
+  [[ "$line" == *"gre/ip"* || "$line" == *"gretap/ip"* ]] || return 1
+  [ "$tun" = "gre0" ] && return 1
+  read -r -a arr <<< "$line"
+  for ((i=0;i<${#arr[@]};i++)); do
+    field="${arr[$i]}"; next="${arr[$((i+1))]:-}"
+    case "$field" in
+      local) local_ip="$next" ;;
+      remote) remote_ip="$next" ;;
+      key|ikey|okey) [ -z "${key:-}" ] && key="$next" ;;
+      ttl) ttl="$next" ;;
+    esac
+  done
+  [ -z "${local_ip:-}" ] && local_ip="unknown"
+  [ -z "${remote_ip:-}" ] && remote_ip="unknown"
+  [ -z "${key:-}" ] && key="none"
+  echo "$tun|$local_ip|$remote_ip|$key|${ttl:-}"
+}
+
+runtime_tunnel_by_name() {
+  local wanted="$1" line parsed tun
+  while IFS= read -r line; do
+    parsed=$(parse_ip_tunnel_line "$line" || true)
+    [ -n "$parsed" ] || continue
+    tun="${parsed%%|*}"
+    [ "$tun" = "$wanted" ] && { echo "$parsed"; return 0; }
+  done < <(ip -d tunnel show 2>/dev/null || ip tunnel show 2>/dev/null || true)
+  return 1
+}
+
+runtime_addr_for_if() { ip -4 -o addr show dev "$1" 2>/dev/null | awk '{print $4}' | head -1; }
+runtime_mtu_for_if() { ip link show dev "$1" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") {print $(i+1); exit}}'; }
+
+list_candidate_services() {
+  { systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}'; systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}'; } | sort -u | grep -E '\.service$' || true
+}
+
+service_looks_like_gre() {
+  local svc="$1" text
+  text=$(systemctl cat "$svc" 2>/dev/null || true)
+  grep -Eiq 'GRE|ip tunnel add|mode gre|setup-gre|gre-manager --up' <<< "$text"
+}
+
+execstart_script_for_service() {
+  local svc="$1" line script
+  line=$(systemctl cat "$svc" 2>/dev/null | grep -E '^[[:space:]]*ExecStart=' | tail -1 | sed 's/^[[:space:]]*ExecStart=//; s/^-//' || true)
+  script=$(awk '{print $1}' <<< "$line")
+  [ -f "$script" ] && echo "$script"
+}
+
+parse_service_script_metadata() {
+  local svc="$1" script="$2" tun local_pub remote_pub key mtu local_cidr remote_tun line expanded desc
+  tun=$(extract_var_from_file "$script" GRE_NAME || true)
+  key=$(extract_var_from_file "$script" GRE_KEY || true)
+  mtu=$(extract_var_from_file "$script" MTU || true)
+
+  line=$(grep -E 'ip[[:space:]]+tunnel[[:space:]]+add|/sbin/ip[[:space:]]+tunnel[[:space:]]+add' "$script" 2>/dev/null | head -1 || true)
+  if [ -n "$line" ]; then
+    expanded=$(expand_vars_from_script "$script" "$line")
+    local parsed
+    parsed=$(parse_ip_tunnel_line "${tun:-unknown}: ${expanded#*ip tunnel add }" 2>/dev/null || true)
+    # Fallback manual parse after expansion.
+    read -r -a arr <<< "$expanded"
+    for ((i=0;i<${#arr[@]};i++)); do
+      case "${arr[$i]}" in
+        add) [ -z "${tun:-}" ] && tun="${arr[$((i+1))]:-}" ;;
+        local) local_pub="${arr[$((i+1))]:-}" ;;
+        remote) remote_pub="${arr[$((i+1))]:-}" ;;
+        key) [ -z "${key:-}" ] && key="${arr[$((i+1))]:-}" ;;
+      esac
+    done
+  fi
+
+  line=$(grep -E 'ip[[:space:]]+addr[[:space:]]+add|/sbin/ip[[:space:]]+addr[[:space:]]+add' "$script" 2>/dev/null | head -1 || true)
+  if [ -n "$line" ]; then
+    expanded=$(expand_vars_from_script "$script" "$line")
+    read -r -a arr <<< "$expanded"
+    for ((i=0;i<${#arr[@]};i++)); do
+      [ "${arr[$i]}" = "add" ] && local_cidr="${arr[$((i+1))]:-}"
+    done
+  fi
+
+  # Fallback variables used in older notes.
+  [ -z "${local_pub:-}" ] && local_pub=$(extract_var_from_file "$script" LOCAL_PUBLIC || true)
+  [ -z "${remote_pub:-}" ] && remote_pub=$(extract_var_from_file "$script" REMOTE_PUBLIC || true)
+  [ -z "${mtu:-}" ] && mtu="unknown"
+  [ -z "${key:-}" ] && key="none"
+  [ -n "${local_cidr:-}" ] && remote_tun=$(peer_from_30 "$local_cidr" || true)
+  [ -z "${remote_tun:-}" ] && remote_tun="unknown"
+  [ -z "${tun:-}" ] && tun="unknown"
+  [ -z "${local_pub:-}" ] && local_pub="unknown"
+  [ -z "${remote_pub:-}" ] && remote_pub="unknown"
+  desc=$(systemctl cat "$svc" 2>/dev/null | grep -E '^[[:space:]]*Description=' | head -1 | sed 's/^[[:space:]]*Description=//' || true)
+  echo "$tun|$local_pub|$remote_pub|$key|$local_cidr|$remote_tun|$mtu|$script|$desc"
+}
+
+is_managed_name() {
+  local name="$1"
+  [ -f "$(config_file "$name")" ]
+}
+
+# Discovery line format:
+# source|id|tun|service|state|enabled|local_public|remote_public|key|local_cidr|remote_tun|mtu|script|notes
+# source = managed, runtime, legacy-service
+
+discover_tunnels() {
+  ensure_dirs
+  local t svc line parsed tun local_pub remote_pub key local_cidr remote_tun mtu state enabled script notes meta
+  local seen=""
+
+  for t in $(list_managed_tunnels); do
+    load_config "$t" >/dev/null 2>&1 || continue
+    svc=$(service_name "$t")
+    state=$(get_systemd_state "$svc")
+    enabled=$(get_systemd_enabled "$svc")
+    echo "managed|$t|$TUN_NAME|$svc|$state|$enabled|$LOCAL_PUBLIC|$REMOTE_PUBLIC|$GRE_KEY|$LOCAL_TUN_IP_CIDR|$REMOTE_TUN_IP|$MTU||manager config"
+    seen="$seen $TUN_NAME "
+  done
+
+  while IFS= read -r line; do
+    parsed=$(parse_ip_tunnel_line "$line" || true)
+    [ -n "$parsed" ] || continue
+    IFS='|' read -r tun local_pub remote_pub key _ttl <<< "$parsed"
+    [[ "$seen" == *" $tun "* ]] && continue
+    local_cidr=$(runtime_addr_for_if "$tun")
+    mtu=$(runtime_mtu_for_if "$tun")
+    remote_tun="unknown"
+    [ -n "$local_cidr" ] && remote_tun=$(peer_from_30 "$local_cidr" || true)
+    [ -z "$remote_tun" ] && remote_tun="unknown"
+    state=$(ip link show "$tun" 2>/dev/null | grep -q 'UP' && echo "up" || echo "down")
+    echo "runtime|$tun|$tun||$state|unknown|$local_pub|$remote_pub|$key|${local_cidr:-unknown}|$remote_tun|${mtu:-unknown}||active kernel tunnel"
+    seen="$seen $tun "
+  done < <(ip -d tunnel show 2>/dev/null || ip tunnel show 2>/dev/null || true)
+
+  for svc in $(list_candidate_services); do
+    [[ "$svc" == $SERVICE_PREFIX-* ]] && continue
+    service_looks_like_gre "$svc" || continue
+    script=$(execstart_script_for_service "$svc" || true)
+    if [ -n "$script" ]; then
+      meta=$(parse_service_script_metadata "$svc" "$script")
+      IFS='|' read -r tun local_pub remote_pub key local_cidr remote_tun mtu script notes <<< "$meta"
+    else
+      tun="unknown"; local_pub="unknown"; remote_pub="unknown"; key="unknown"; local_cidr="unknown"; remote_tun="unknown"; mtu="unknown"; notes="no setup script parsed"
+    fi
+    [[ "$seen" == *" $tun "* && "$tun" != "unknown" ]] && continue
+    state=$(get_systemd_state "$svc")
+    enabled=$(get_systemd_enabled "$svc")
+    echo "legacy-service|$svc|$tun|$svc|$state|$enabled|$local_pub|$remote_pub|$key|${local_cidr:-unknown}|${remote_tun:-unknown}|${mtu:-unknown}|${script:-}|${notes:-legacy GRE service}"
+    [ "$tun" != "unknown" ] && seen="$seen $tun "
+  done
+}
+
+show_discovery_table() {
+  local lines source id tun svc state enabled lp rp key lc rt mtu script notes i=1
+  mapfile -t lines < <(discover_tunnels)
+  if [ "${#lines[@]}" -eq 0 ]; then echo "No GRE tunnels/services detected."; return 1; fi
+  printf '%-4s %-15s %-14s %-28s %-10s %-9s %-15s %-15s %-10s %-16s\n' "No" "Interface" "Source" "Service" "State" "Enabled" "LocalPub" "RemotePub" "Key" "TunnelIP"
+  hr
+  for line in "${lines[@]}"; do
+    IFS='|' read -r source id tun svc state enabled lp rp key lc rt mtu script notes <<< "$line"
+    printf '%-4s %-15s %-14s %-28s %-10s %-9s %-15s %-15s %-10s %-16s\n' "$i" "$tun" "$source" "${svc:-}" "$state" "$enabled" "$lp" "$rp" "$key" "$lc"
+    i=$((i+1))
+  done
+  return 0
+}
+
+choose_discovered_tunnel() {
+  local prompt="${1:-Choose tunnel}" lines i choice line
+  mapfile -t lines < <(discover_tunnels)
+  if [ "${#lines[@]}" -eq 0 ]; then echo "No GRE tunnels/services detected."; return 1; fi
+  echo
+  echo "$prompt:"
+  printf '%-4s %-15s %-14s %-28s %-10s %-16s\n' "No" "Interface" "Source" "Service" "State" "TunnelIP"
+  hr
+  i=1
+  for line in "${lines[@]}"; do
+    local source id tun svc state enabled lp rp key lc rt mtu script notes
+    IFS='|' read -r source id tun svc state enabled lp rp key lc rt mtu script notes <<< "$line"
+    printf '%-4s %-15s %-14s %-28s %-10s %-16s\n' "$i" "$tun" "$source" "${svc:-}" "$state" "$lc"
+    i=$((i+1))
+  done
+  echo "  0) Back"
+  while true; do
+    read -r -p "Select: " choice
+    [ "$choice" = "0" ] && return 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#lines[@]}" ]; then
+      CHOSEN_LINE="${lines[$((choice-1))]}"
+      return 0
+    fi
+    echo "Invalid choice."
+  done
+}
+
+line_get() {
+  local line="$1" idx="$2" IFS='|' arr
+  read -r -a arr <<< "$line"
+  echo "${arr[$idx]:-}"
+}
+
+# ---------- Tunnel lifecycle ----------
+
+bring_up_tunnel() {
+  local name="$1"
+  load_config "$name" || return 1
+  modprobe ip_gre 2>/dev/null || true
+  ip tunnel del "$TUN_NAME" 2>/dev/null || true
+  if [ "${GRE_KEY:-none}" = "none" ] || [ -z "${GRE_KEY:-}" ]; then
+    ip tunnel add "$TUN_NAME" mode gre local "$LOCAL_PUBLIC" remote "$REMOTE_PUBLIC" ttl 255
+  else
+    ip tunnel add "$TUN_NAME" mode gre local "$LOCAL_PUBLIC" remote "$REMOTE_PUBLIC" key "$GRE_KEY" ttl 255
+  fi
+  ip addr add "$LOCAL_TUN_IP_CIDR" dev "$TUN_NAME"
+  ip link set "$TUN_NAME" mtu "$MTU"
+  ip link set "$TUN_NAME" up
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
+  if [ "${DISABLE_RPFILTER:-yes}" = "yes" ]; then
+    sysctl -w "net.ipv4.conf.$TUN_NAME.rp_filter=0" >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+  fi
+  add_gre_firewall_rules "$TUN_NAME" "$REMOTE_PUBLIC"
+  [ "${MSS_CLAMP:-yes}" = "yes" ] && apply_mss_clamp_rules "$TUN_NAME"
+  mkdir -p /etc/sysctl.d
+  cat > "/etc/sysctl.d/99-gre-manager-$TUN_NAME.conf" <<EOF2
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.$TUN_NAME.rp_filter=0
+EOF2
+  echo "Tunnel $TUN_NAME is up."
+  ip tunnel show "$TUN_NAME" || true
+  ip addr show "$TUN_NAME" || true
+}
+
+bring_down_tunnel() {
+  local name="$1"
+  load_config "$name" >/dev/null 2>&1 || true
+  local tun="${TUN_NAME:-$name}" peer="${REMOTE_PUBLIC:-}"
+  ip link set "$tun" down 2>/dev/null || true
+  ip tunnel del "$tun" 2>/dev/null || true
+  remove_mss_clamp_rules "$tun" || true
+  [ -n "$peer" ] && remove_gre_firewall_rules "$tun" "$peer" || true
+  echo "Tunnel $tun is down."
+}
+
+write_systemd_service() {
+  local name="$1" svc
+  svc=$(service_name "$name")
+  cat > "/etc/systemd/system/$svc" <<EOF2
+[Unit]
+Description=GRE Manager Tunnel $name
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$INSTALL_PATH --up $name
+ExecStop=$INSTALL_PATH --down $name
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+}
+
+enable_start_service() {
+  local name="$1" svc
+  svc=$(service_name "$name")
+  write_systemd_service "$name"
+  systemctl daemon-reload
+  systemctl enable "$svc" >/dev/null
+  systemctl restart "$svc"
+}
+
+stop_disable_service() {
+  local name="$1" svc
+  svc=$(service_name "$name")
+  systemctl stop "$svc" >/dev/null 2>&1 || true
+  systemctl disable "$svc" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/$svc"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+# ---------- Watchdog ----------
+
+watchdog_check() {
+  local name="$1" log_file
+  load_config "$name" || exit 1
+  log_file="$LOG_DIR/$name-watchdog.log"
+  mkdir -p "$LOG_DIR"
+  log_line() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$log_file"; }
+  if ! ip link show "$TUN_NAME" >/dev/null 2>&1; then log_line "BAD: interface missing; restarting service."; systemctl restart "$(service_name "$name")" >/dev/null 2>&1 || true; exit 1; fi
+  if ! ip link show "$TUN_NAME" | grep -q "UP"; then log_line "BAD: interface not UP; restarting service."; systemctl restart "$(service_name "$name")" >/dev/null 2>&1 || true; exit 1; fi
+  local ping_ok
+  ping_ok=$(ping -I "$TUN_NAME" -c 5 -W 1 "$REMOTE_TUN_IP" 2>/dev/null | awk -F',' '/received/ {gsub(/[^0-9]/,"",$2); print $2}' | tail -1)
+  ping_ok="${ping_ok:-0}"
+  if [ "$ping_ok" -lt 4 ]; then log_line "BAD: ping weak ${ping_ok}/5 to $REMOTE_TUN_IP; restarting service."; systemctl restart "$(service_name "$name")" >/dev/null 2>&1 || true; exit 1; fi
+  local tcp_ok=0 tcp_total=0 p
+  for p in ${TEST_PORTS:-}; do
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+    tcp_total=$((tcp_total+1))
+    if timeout 4 bash -c "cat < /dev/null > /dev/tcp/${REMOTE_TUN_IP}/${p}" >/dev/null 2>&1; then tcp_ok=$((tcp_ok+1)); fi
+  done
+  if [ "$tcp_total" -gt 0 ] && [ "$tcp_ok" -lt 1 ]; then log_line "BAD: all TCP tests failed ${tcp_ok}/${tcp_total}; restarting service."; systemctl restart "$(service_name "$name")" >/dev/null 2>&1 || true; exit 1; fi
+  log_line "OK: ping ${ping_ok}/5, tcp ${tcp_ok}/${tcp_total}"
+  exit 0
+}
+
+write_watchdog_units() {
+  local name="$1" svc timer interval
+  svc=$(watchdog_service_name "$name"); timer=$(watchdog_timer_name "$name"); interval="${WATCHDOG_INTERVAL:-$DEFAULT_WATCHDOG_INTERVAL}"
+  cat > "/etc/systemd/system/$svc" <<EOF2
+[Unit]
+Description=GRE Manager Watchdog for $name
+After=network-online.target $(service_name "$name")
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_PATH --watchdog $name
+EOF2
+  cat > "/etc/systemd/system/$timer" <<EOF2
+[Unit]
+Description=Run GRE Manager watchdog for $name every $interval
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=$interval
+AccuracySec=10s
+Unit=$svc
+
+[Install]
+WantedBy=timers.target
+EOF2
+}
+
+enable_watchdog() {
+  local name="$1" timer
+  load_config "$name" || return 1
+  WATCHDOG_ENABLED="yes"; write_config "$name"; write_watchdog_units "$name"
+  timer=$(watchdog_timer_name "$name")
+  systemctl daemon-reload
+  systemctl enable --now "$timer" >/dev/null
+  msg "Watchdog enabled for $name."
+}
+
+disable_watchdog() {
+  local name="$1" svc timer
+  svc=$(watchdog_service_name "$name"); timer=$(watchdog_timer_name "$name")
+  systemctl stop "$timer" >/dev/null 2>&1 || true
+  systemctl disable "$timer" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/$svc" "/etc/systemd/system/$timer"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  load_config "$name" >/dev/null 2>&1 || return 0
+  WATCHDOG_ENABLED="no"; write_config "$name"
+  msg "Watchdog disabled for $name."
+}
+
+# ---------- Installation ----------
+
+install_manager() {
+  require_root; ensure_dirs
+  local src="${BASH_SOURCE[0]}"
+  if [ "$src" = "$INSTALL_PATH" ]; then msg "Already installed at $INSTALL_PATH"; else
+    if [ -r "$src" ]; then cp "$src" "$INSTALL_PATH"; chmod +x "$INSTALL_PATH"; msg "Installed to $INSTALL_PATH"; else err "Cannot read script source. Save this file first, then run: install -m 755 gre-manager.sh $INSTALL_PATH"; return 1; fi
+  fi
+}
+
+# ---------- Interactive functions ----------
+
+menu_header() {
+  clear 2>/dev/null || true
+  echo "$APP_NAME v$APP_VERSION"
+  echo "Config dir: $CONFIG_DIR"
+  hr
+}
+
+precheck_gre() {
+  menu_header
+  echo "GRE pre-check"
+  echo
+  echo "Run this option on BOTH servers. Use the same test key and test subnet prefix on both sides."
+  echo "This creates a temporary GRE interface, tests ping, then removes it by default."
+  echo
+  echo "0) Back"
+  read -r -p "Press Enter to continue or 0 to go back: " back
+  [ "$back" = "0" ] && return 0
+  local peer local_ip key mtu prefix lname local_int peer_int local_tun remote_tun
+  peer=$(ask_ipv4 "Enter peer public IP")
+  local_ip=$(ask_local_public_ip "$peer")
+  key=$(ask_number "Enter temporary GRE key" "$DEFAULT_TEST_KEY"); while ! valid_key "$key"; do key=$(ask_number "Invalid key. Enter GRE key" "$DEFAULT_TEST_KEY"); done
+  mtu=$(ask_number "Enter temporary MTU" "$DEFAULT_MTU"); while ! valid_mtu "$mtu"; do mtu=$(ask_number "Invalid MTU. Enter MTU 576-1476" "$DEFAULT_MTU"); done
+  read -r -p "Enter test subnet prefix without .1/.2 [$DEFAULT_TEST_SUBNET_PREFIX]: " prefix
+  prefix="${prefix:-$DEFAULT_TEST_SUBNET_PREFIX}"
+  if ! [[ "$prefix" =~ ^([0-9]{1,3}\.){2}[0-9]{1,3}$ ]]; then warn "Invalid prefix. Using $DEFAULT_TEST_SUBNET_PREFIX"; prefix="$DEFAULT_TEST_SUBNET_PREFIX"; fi
+  local_int=$(ip_to_int "$local_ip"); peer_int=$(ip_to_int "$peer")
+  if [ "$local_int" -lt "$peer_int" ]; then local_tun="$prefix.1/30"; remote_tun="$prefix.2"; else local_tun="$prefix.2/30"; remote_tun="$prefix.1"; fi
+  lname="grecheck"
+  echo; echo "Temporary test settings:"; echo "  Local public:  $local_ip"; echo "  Peer public:   $peer"; echo "  Interface:     $lname"; echo "  Key:           $key"; echo "  Local tunnel:  $local_tun"; echo "  Peer tunnel:   $remote_tun"; echo "  MTU:           $mtu"; echo
+  echo "Now run option 0 on the peer server with the same key/subnet, then press Enter here."
+  read -r -p "Ready? Press Enter to create and test..." _
+  modprobe ip_gre 2>/dev/null || true
+  ip tunnel del "$lname" 2>/dev/null || true
+  ip tunnel add "$lname" mode gre local "$local_ip" remote "$peer" key "$key" ttl 255
+  ip addr add "$local_tun" dev "$lname"
+  ip link set "$lname" mtu "$mtu"
+  ip link set "$lname" up
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
+  sysctl -w "net.ipv4.conf.$lname.rp_filter=0" >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+  add_gre_firewall_rules "$lname" "$peer"
+  echo; echo "Interface created:"; ip tunnel show "$lname" || true; ip addr show "$lname" || true
+  echo; echo "Testing ping to $remote_tun ..."
+  if ping -I "$lname" -c 5 -W 1 "$remote_tun"; then echo; echo "RESULT: GRE basic connectivity looks OK."; else echo; echo "RESULT: Ping failed."; echo "Possible causes: peer side not ready, GRE/protocol 47 blocked, wrong public IP, wrong key, firewall, rp_filter, or provider filtering."; fi
+  if confirm "Remove temporary interface $lname now?" "y"; then ip link set "$lname" down 2>/dev/null || true; ip tunnel del "$lname" 2>/dev/null || true; remove_gre_firewall_rules "$lname" "$peer"; echo "Temporary interface removed."; else echo "Temporary interface kept. Remove later with: ip tunnel del $lname"; fi
+  pause
+}
+
+setup_tunnel() {
+  menu_header
+  echo "Create GRE tunnel"
+  echo
+  echo "Choose this server role. This is only for default suggestions; GRE works the same on both sides."
+  echo "  1) Iran side"
+  echo "  2) Foreign side"
+  echo "  0) Back"
+  local role_choice role default_local_tun default_remote_tun
+  read -r -p "Select: " role_choice
+  case "$role_choice" in
+    1) role="iran"; default_local_tun="10.80.0.2/30"; default_remote_tun="10.80.0.1" ;;
+    2) role="foreign"; default_local_tun="10.80.0.1/30"; default_remote_tun="10.80.0.2" ;;
+    0) return 0 ;;
+    *) echo "Invalid choice."; pause; return 0 ;;
+  esac
+  local remote_public local_public tun key mtu local_tun remote_tun mss rp watchdog ports existing
+  remote_public=$(ask_ipv4 "Enter peer public IP")
+  local_public=$(ask_local_public_ip "$remote_public")
+  while true; do
+    read -r -p "Enter tunnel/interface name, max 15 chars [gre2]: " tun
+    tun="${tun:-gre2}"
+    if safe_name "$tun"; then
+      existing=$(config_file "$tun")
+      if [ -f "$existing" ]; then echo "A tunnel named $tun already exists. Choose another name or edit it from menu."; else break; fi
+    else echo "Invalid name. Use only A-Z a-z 0-9 _ . - and max 15 chars."; fi
+  done
+  key=$(ask_number "Enter GRE key" "8020"); while ! valid_key "$key"; do key=$(ask_number "Invalid key. Enter GRE key 0-4294967295" "8020"); done
+  mtu=$(ask_number "Enter MTU" "$DEFAULT_MTU"); while ! valid_mtu "$mtu"; do mtu=$(ask_number "Invalid MTU. Enter MTU 576-1476" "$DEFAULT_MTU"); done
+  echo; echo "Tunnel private IP guide:"; echo "  One side must use .1/30 and the other side must use .2/30 from the same /30 subnet."; echo "  Example Foreign: 10.80.0.1/30"; echo "  Example Iran:    10.80.0.2/30"; echo "  Do NOT reuse a subnet already used by another GRE tunnel."; echo
+  local_tun=$(ask_ipv4_cidr "Enter THIS server tunnel IP/CIDR" "$default_local_tun")
+  remote_tun=$(ask_ipv4 "Enter PEER tunnel IP without CIDR" "$default_remote_tun")
+  confirm "Enable MSS clamp for OUTPUT and FORWARD both directions?" "y" && mss="yes" || mss="no"
+  confirm "Disable rp_filter for this GRE tunnel? Recommended for multi-tunnel routing." "y" && rp="yes" || rp="no"
+  confirm "Enable watchdog timer to restart tunnel if ping fails?" "n" && watchdog="yes" || watchdog="no"
+  ports=""
+  if [ "$watchdog" = "yes" ]; then read -r -p "Optional TCP test ports on peer tunnel IP, space separated. Leave empty for ping only: " ports; ports="${ports:-}"; fi
+  TUN_NAME="$tun"; ROLE="$role"; LOCAL_PUBLIC="$local_public"; REMOTE_PUBLIC="$remote_public"; GRE_KEY="$key"; LOCAL_TUN_IP_CIDR="$local_tun"; REMOTE_TUN_IP="$remote_tun"; MTU="$mtu"; MSS_CLAMP="$mss"; DISABLE_RPFILTER="$rp"; WATCHDOG_ENABLED="$watchdog"; TEST_PORTS="$ports"
+  echo; echo "Summary:"; echo "  Name:          $TUN_NAME"; echo "  Role:          $ROLE"; echo "  Local public:  $LOCAL_PUBLIC"; echo "  Remote public: $REMOTE_PUBLIC"; echo "  Key:           $GRE_KEY"; echo "  Local tunnel:  $LOCAL_TUN_IP_CIDR"; echo "  Remote tunnel: $REMOTE_TUN_IP"; echo "  MTU:           $MTU"; echo "  MSS clamp:     $MSS_CLAMP"; echo "  rp_filter off: $DISABLE_RPFILTER"; echo "  Watchdog:      $WATCHDOG_ENABLED"; echo
+  if ! confirm "Create and start this tunnel?" "y"; then echo "Cancelled."; pause; return 0; fi
+  install_manager >/dev/null 2>&1 || true
+  write_config "$tun"
+  enable_start_service "$tun"
+  [ "$watchdog" = "yes" ] && enable_watchdog "$tun"
+  save_firewall_if_possible
+  echo; echo "Created and started. Test with: ping $REMOTE_TUN_IP"
+  systemctl status "$(service_name "$tun")" --no-pager || true
+  pause
+}
+
+import_discovered_tunnel() {
+  menu_header
+  echo "Discover / Import existing GRE tunnels"
+  echo
+  show_discovery_table || { pause; return 0; }
+  echo
+  echo "1) Import/adopt one detected tunnel into GRE Manager"
+  echo "2) Refresh list"
+  echo "0) Back"
+  local c line source id tun svc state enabled lp rp key lc rt mtu script notes name role mss rpf wd ports
+  read -r -p "Select: " c
+  case "$c" in
+    1)
+      choose_discovered_tunnel "Choose detected tunnel to import" || { pause; return 0; }
+      line="$CHOSEN_LINE"
+      IFS='|' read -r source id tun svc state enabled lp rp key lc rt mtu script notes <<< "$line"
+      if [ "$source" = "managed" ]; then echo "This tunnel is already managed."; pause; return 0; fi
+      [ "$tun" = "unknown" ] && { read -r -p "Enter interface name to manage: " tun; safe_name "$tun" || { echo "Invalid name."; pause; return 0; }; }
+      name="$tun"
+      if [ -f "$(config_file "$name")" ]; then echo "Manager config already exists for $name."; pause; return 0; fi
+      [ "$lp" = "unknown" ] && lp=$(ask_local_public_ip "")
+      [ "$rp" = "unknown" ] && rp=$(ask_ipv4 "Enter peer public IP")
+      [ "$key" = "unknown" ] && key="none"
+      [ "$key" = "none" ] && { read -r -p "GRE key not detected. Enter key or leave empty for no key: " key; key="${key:-none}"; }
+      [ "$lc" = "unknown" ] && lc=$(ask_ipv4_cidr "Enter local tunnel IP/CIDR")
+      [ "$rt" = "unknown" ] && rt=$(ask_ipv4 "Enter peer tunnel IP without CIDR" "$(peer_from_30 "$lc" 2>/dev/null || true)")
+      [ "$mtu" = "unknown" ] && mtu="$DEFAULT_MTU"
+      read -r -p "Role label [imported]: " role; role="${role:-imported}"
+      confirm "Enable MSS clamp in manager config?" "y" && mss="yes" || mss="no"
+      confirm "Disable rp_filter in manager config?" "y" && rpf="yes" || rpf="no"
+      confirm "Enable watchdog?" "n" && wd="yes" || wd="no"
+      ports=""
+      [ "$wd" = "yes" ] && read -r -p "Optional TCP test ports, space separated: " ports
+      TUN_NAME="$tun"; ROLE="$role"; LOCAL_PUBLIC="$lp"; REMOTE_PUBLIC="$rp"; GRE_KEY="$key"; LOCAL_TUN_IP_CIDR="$lc"; REMOTE_TUN_IP="$rt"; MTU="$mtu"; MSS_CLAMP="$mss"; DISABLE_RPFILTER="$rpf"; WATCHDOG_ENABLED="$wd"; TEST_PORTS="$ports"
+      echo; echo "Import summary:"; echo "  Interface: $TUN_NAME"; echo "  Source:    $source"; echo "  Old svc:   ${svc:-none}"; echo "  Local:     $LOCAL_PUBLIC -> $LOCAL_TUN_IP_CIDR"; echo "  Remote:    $REMOTE_PUBLIC -> $REMOTE_TUN_IP"; echo "  Key/MTU:   $GRE_KEY / $MTU"; echo
+      if ! confirm "Write manager config and create manager systemd service?" "y"; then echo "Cancelled."; pause; return 0; fi
+      install_manager >/dev/null 2>&1 || true
+      write_config "$name"
+      if [ -n "$svc" ] && [ "$source" = "legacy-service" ]; then
+        if confirm "Disable old legacy service $svc to avoid duplicate startup?" "n"; then systemctl stop "$svc" >/dev/null 2>&1 || true; systemctl disable "$svc" >/dev/null 2>&1 || true; fi
+      fi
+      enable_start_service "$name"
+      [ "$wd" = "yes" ] && enable_watchdog "$name"
+      save_firewall_if_possible
+      echo "Imported and started as $(service_name "$name")."
+      pause
+      ;;
+    2) import_discovered_tunnel ;;
+    *) return 0 ;;
+  esac
+}
+
+delete_tunnel() {
+  menu_header
+  choose_discovered_tunnel "Delete/remove tunnel" || { pause; return 0; }
+  local line source id tun svc state enabled lp rp key lc rt mtu script notes
+  line="$CHOSEN_LINE"
+  IFS='|' read -r source id tun svc state enabled lp rp key lc rt mtu script notes <<< "$line"
+  echo; echo "Selected:"; echo "  Source:    $source"; echo "  Interface: $tun"; echo "  Service:   ${svc:-none}"; echo "  Script:    ${script:-none}"; echo
+  if [ "$source" = "managed" ]; then
+    if ! confirm "Delete managed tunnel $id permanently?" "n"; then echo "Cancelled."; pause; return 0; fi
+    load_config "$id" || true
+    disable_watchdog "$id" >/dev/null 2>&1 || true
+    stop_disable_service "$id"
+    bring_down_tunnel "$id" >/dev/null 2>&1 || true
+    rm -f "$(config_file "$id")" "/etc/sysctl.d/99-gre-manager-$id.conf" "/etc/sysctl.d/99-gre-manager-$tun.conf"
+    save_firewall_if_possible
+    echo "Managed tunnel $id deleted."
+  else
+    if confirm "Remove runtime interface $tun now?" "y"; then ip link set "$tun" down 2>/dev/null || true; ip tunnel del "$tun" 2>/dev/null || true; remove_mss_clamp_rules "$tun" || true; fi
+    if [ -n "$svc" ] && [ "$svc" != "unknown" ] && confirm "Stop and disable service $svc?" "n"; then systemctl stop "$svc" >/dev/null 2>&1 || true; systemctl disable "$svc" >/dev/null 2>&1 || true; fi
+    if [ -n "$svc" ] && [ "$svc" != "unknown" ] && confirm "Delete service file /etc/systemd/system/$svc?" "n"; then rm -f "/etc/systemd/system/$svc"; systemctl daemon-reload; fi
+    if [ -n "$script" ] && [ -f "$script" ] && confirm "Delete setup script $script?" "n"; then rm -f "$script"; fi
+    save_firewall_if_possible
+    echo "Removal actions completed."
+  fi
+  pause
+}
+
+edit_tunnel() {
+  menu_header
+  choose_discovered_tunnel "Edit tunnel" || { pause; return 0; }
+  local line source id
+  line="$CHOSEN_LINE"; source=$(line_get "$line" 0); id=$(line_get "$line" 1)
+  if [ "$source" != "managed" ]; then echo "This tunnel is not managed yet. Import it first from Discover/Import menu."; pause; return 0; fi
+  local name="$id" v
+  load_config "$name" || { pause; return 0; }
+  echo; echo "Editing managed tunnel: $name"; echo "Press Enter to keep current value."
+  v=$(ask_ipv4 "Local public IP" "$LOCAL_PUBLIC"); LOCAL_PUBLIC="$v"
+  v=$(ask_ipv4 "Remote public IP" "$REMOTE_PUBLIC"); REMOTE_PUBLIC="$v"
+  read -r -p "GRE key [$GRE_KEY] (use none for no key): " v; v="${v:-$GRE_KEY}"; if [ "$v" != "none" ]; then while ! valid_key "$v"; do v=$(ask_number "Invalid key. GRE key" "$GRE_KEY"); done; fi; GRE_KEY="$v"
+  v=$(ask_number "MTU" "$MTU"); while ! valid_mtu "$v"; do v=$(ask_number "Invalid MTU. MTU" "$MTU"); done; MTU="$v"
+  v=$(ask_ipv4_cidr "Local tunnel IP/CIDR" "$LOCAL_TUN_IP_CIDR"); LOCAL_TUN_IP_CIDR="$v"
+  v=$(ask_ipv4 "Remote tunnel IP" "$REMOTE_TUN_IP"); REMOTE_TUN_IP="$v"
+  confirm "Enable MSS clamp?" "$([ "$MSS_CLAMP" = yes ] && echo y || echo n)" && MSS_CLAMP="yes" || MSS_CLAMP="no"
+  confirm "Disable rp_filter?" "$([ "$DISABLE_RPFILTER" = yes ] && echo y || echo n)" && DISABLE_RPFILTER="yes" || DISABLE_RPFILTER="no"
+  confirm "Enable watchdog?" "$([ "$WATCHDOG_ENABLED" = yes ] && echo y || echo n)" && WATCHDOG_ENABLED="yes" || WATCHDOG_ENABLED="no"
+  if [ "$WATCHDOG_ENABLED" = "yes" ]; then read -r -p "TCP test ports [$TEST_PORTS]: " v; TEST_PORTS="${v:-$TEST_PORTS}"; fi
+  write_config "$name"
+  enable_start_service "$name"
+  if [ "$WATCHDOG_ENABLED" = "yes" ]; then enable_watchdog "$name"; else disable_watchdog "$name" >/dev/null 2>&1 || true; fi
+  save_firewall_if_possible
+  echo "Tunnel $name updated and restarted."
+  pause
+}
+
+logs_menu() {
+  menu_header
+  choose_discovered_tunnel "View logs/status" || { pause; return 0; }
+  local line source id tun svc state enabled lp rp key lc rt mtu script notes timer log_file c
+  line="$CHOSEN_LINE"
+  IFS='|' read -r source id tun svc state enabled lp rp key lc rt mtu script notes <<< "$line"
+  if [ "$source" = "managed" ]; then timer=$(watchdog_timer_name "$id"); log_file="$LOG_DIR/$id-watchdog.log"; fi
+  echo; echo "1) Service status"; echo "2) Last 80 service journal lines"; echo "3) Follow service journal"; echo "4) Watchdog timer status (managed only)"; echo "5) Watchdog log tail (managed only)"; echo "0) Back"
+  read -r -p "Select: " c
+  case "$c" in
+    1) [ -n "${svc:-}" ] && systemctl status "$svc" --no-pager || echo "No service detected for $tun"; pause ;;
+    2) [ -n "${svc:-}" ] && journalctl -u "$svc" -n 80 --no-pager || echo "No service detected for $tun"; pause ;;
+    3) [ -n "${svc:-}" ] && { echo "Press Ctrl+C to stop."; journalctl -u "$svc" -f; } || { echo "No service detected for $tun"; pause; } ;;
+    4) [ -n "${timer:-}" ] && systemctl status "$timer" --no-pager || echo "No managed watchdog timer."; pause ;;
+    5) [ -n "${log_file:-}" ] && [ -f "$log_file" ] && tail -n 80 "$log_file" || echo "No watchdog log found."; pause ;;
+    *) return 0 ;;
+  esac
+}
+
+health_menu() {
+  menu_header
+  choose_discovered_tunnel "Check tunnel health" || { pause; return 0; }
+  local line source id tun svc state enabled lp rp key lc rt mtu script notes remote_tun p ports
+  line="$CHOSEN_LINE"
+  IFS='|' read -r source id tun svc state enabled lp rp key lc rt mtu script notes <<< "$line"
+  remote_tun="$rt"
+  [ "$remote_tun" = "unknown" ] && remote_tun=$(ask_ipv4 "Enter peer tunnel IP for ping test")
+  echo; echo "Checking $tun ..."; echo "Interface: $tun"; echo "Peer tunnel IP: $remote_tun"; echo
+  if ip link show "$tun" >/dev/null 2>&1; then echo "Interface exists: yes"; ip -br addr show "$tun" || true; else echo "Interface exists: no"; fi
+  echo; echo "ip tunnel show:"; ip tunnel show "$tun" || true
+  echo; echo "Ping test:"; ping -I "$tun" -c 5 -W 1 "$remote_tun" || true
+  read -r -p "Optional TCP ports to test, space separated. Leave empty to skip: " ports
+  if [ -n "$ports" ]; then
+    echo; echo "TCP tests:"
+    for p in $ports; do
+      if timeout 4 bash -c "cat < /dev/null > /dev/tcp/${remote_tun}/${p}" >/dev/null 2>&1; then echo "  $remote_tun:$p OK"; else echo "  $remote_tun:$p FAILED"; fi
+    done
+  fi
+  pause
+}
+
+show_details_menu() {
+  menu_header
+  echo "Detected GRE tunnels and services:"
+  echo
+  local lines line source id tun svc state enabled lp rp key lc rt mtu script notes
+  mapfile -t lines < <(discover_tunnels)
+  if [ "${#lines[@]}" -eq 0 ]; then echo "No GRE tunnels/services detected."; pause; return 0; fi
+  for line in "${lines[@]}"; do
+    IFS='|' read -r source id tun svc state enabled lp rp key lc rt mtu script notes <<< "$line"
+    hr
+    echo "Source:        $source"
+    echo "ID:            $id"
+    echo "Interface:     $tun"
+    echo "Service:       ${svc:-none}"
+    echo "State/enabled: $state / $enabled"
+    echo "Local public:  $lp"
+    echo "Remote public: $rp"
+    echo "GRE key:       $key"
+    echo "Local tunnel:  $lc"
+    echo "Remote tunnel: $rt"
+    echo "MTU:           $mtu"
+    echo "Setup script:  ${script:-none}"
+    echo "Notes:         ${notes:-}"
+    echo "MSS clamp:     $(mss_status_for_if "$tun")"
+    echo "rp_filter:     $(sysctl -n "net.ipv4.conf.$tun.rp_filter" 2>/dev/null || echo "not available")"
+    echo "Current state:"
+    ip -br addr show "$tun" 2>/dev/null || echo "  interface not present"
+  done
+  hr
+  pause
+}
+
+mss_menu() {
+  while true; do
+    menu_header
+    echo "MSS clamp management"
+    echo
+    show_mss_rules
+    echo
+    echo "Detected GRE interfaces:"
+    show_discovery_table || true
+    echo
+    echo "1) Enable MSS clamp for a detected GRE interface"
+    echo "2) Remove MSS clamp for a detected GRE interface"
+    echo "3) Enable MSS clamp by custom interface name"
+    echo "4) Remove MSS clamp by custom interface name"
+    echo "5) Save iptables rules with netfilter-persistent"
+    echo "0) Back"
+    local c line tun source id
+    read -r -p "Select: " c
+    case "$c" in
+      1) choose_discovered_tunnel "Choose interface" || continue; line="$CHOSEN_LINE"; tun=$(line_get "$line" 2); apply_mss_clamp_rules "$tun"; source=$(line_get "$line" 0); id=$(line_get "$line" 1); if [ "$source" = "managed" ]; then load_config "$id" && MSS_CLAMP="yes" && write_config "$id"; fi; echo "MSS clamp enabled for $tun."; pause ;;
+      2) choose_discovered_tunnel "Choose interface" || continue; line="$CHOSEN_LINE"; tun=$(line_get "$line" 2); remove_mss_clamp_rules "$tun"; source=$(line_get "$line" 0); id=$(line_get "$line" 1); if [ "$source" = "managed" ]; then load_config "$id" && MSS_CLAMP="no" && write_config "$id"; fi; echo "MSS clamp removed for $tun."; pause ;;
+      3) read -r -p "Interface name: " tun; safe_name "$tun" && apply_mss_clamp_rules "$tun" && echo "MSS clamp enabled for $tun." || echo "Invalid interface name."; pause ;;
+      4) read -r -p "Interface name: " tun; safe_name "$tun" && remove_mss_clamp_rules "$tun" && echo "MSS clamp removed for $tun." || echo "Invalid interface name."; pause ;;
+      5) save_firewall_if_possible; echo "Saved if netfilter-persistent is installed."; pause ;;
+      0) return 0 ;;
+      *) echo "Invalid choice."; pause ;;
+    esac
+  done
+}
+
+rpfilter_menu() {
+  while true; do
+    menu_header
+    echo "rp_filter management"
+    echo
+    echo "Recommended for GRE/multi-route setups: rp_filter=0 on the GRE interface."
+    echo
+    show_discovery_table || true
+    echo
+    local lines line source id tun current disabled
+    mapfile -t lines < <(discover_tunnels)
+    if [ "${#lines[@]}" -gt 0 ]; then
+      echo; echo "Current rp_filter values:"
+      for line in "${lines[@]}"; do
+        source=$(line_get "$line" 0); id=$(line_get "$line" 1); tun=$(line_get "$line" 2)
+        current=$(sysctl -n "net.ipv4.conf.$tun.rp_filter" 2>/dev/null || echo "not available")
+        disabled="unknown"
+        if [ "$source" = "managed" ] && load_config "$id" >/dev/null 2>&1; then disabled="$DISABLE_RPFILTER"; fi
+        echo "  $tun: rp_filter=$current, manager_disable=$disabled"
+      done
+    fi
+    echo
+    echo "1) Set rp_filter=0 for a detected interface"
+    echo "2) Set rp_filter=1 for a detected interface"
+    echo "3) Set rp_filter=0 by custom interface name"
+    echo "4) Set all.rp_filter=0"
+    echo "0) Back"
+    local c
+    read -r -p "Select: " c
+    case "$c" in
+      1) choose_discovered_tunnel "Choose interface" || continue; line="$CHOSEN_LINE"; tun=$(line_get "$line" 2); source=$(line_get "$line" 0); id=$(line_get "$line" 1); sysctl -w "net.ipv4.conf.$tun.rp_filter=0" || true; sysctl -w net.ipv4.conf.all.rp_filter=0 || true; if [ "$source" = "managed" ]; then load_config "$id" && DISABLE_RPFILTER="yes" && write_config "$id"; fi; echo "rp_filter disabled for $tun."; pause ;;
+      2) choose_discovered_tunnel "Choose interface" || continue; line="$CHOSEN_LINE"; tun=$(line_get "$line" 2); source=$(line_get "$line" 0); id=$(line_get "$line" 1); sysctl -w "net.ipv4.conf.$tun.rp_filter=1" || true; if [ "$source" = "managed" ]; then load_config "$id" && DISABLE_RPFILTER="no" && write_config "$id"; fi; echo "rp_filter set to 1 for $tun."; pause ;;
+      3) read -r -p "Interface name: " tun; safe_name "$tun" && sysctl -w "net.ipv4.conf.$tun.rp_filter=0" && sysctl -w net.ipv4.conf.all.rp_filter=0 || echo "Invalid or unavailable interface."; pause ;;
+      4) sysctl -w net.ipv4.conf.all.rp_filter=0 || true; echo "all.rp_filter set to 0."; pause ;;
+      0) return 0 ;;
+      *) echo "Invalid choice."; pause ;;
+    esac
+  done
+}
+
+watchdog_menu() {
+  while true; do
+    menu_header
+    echo "Watchdog management"
+    echo
+    echo "Watchdog is available only for managed tunnels. Import old GRE tunnels first if needed."
+    echo
+    echo "1) Enable watchdog for a managed tunnel"
+    echo "2) Disable watchdog for a managed tunnel"
+    echo "3) Run watchdog check now"
+    echo "0) Back"
+    local c line source id
+    read -r -p "Select: " c
+    case "$c" in
+      1) choose_discovered_tunnel "Choose managed tunnel" || continue; line="$CHOSEN_LINE"; source=$(line_get "$line" 0); id=$(line_get "$line" 1); [ "$source" = "managed" ] && enable_watchdog "$id" || echo "Not managed. Import first."; pause ;;
+      2) choose_discovered_tunnel "Choose managed tunnel" || continue; line="$CHOSEN_LINE"; source=$(line_get "$line" 0); id=$(line_get "$line" 1); [ "$source" = "managed" ] && disable_watchdog "$id" || echo "Not managed. Import first."; pause ;;
+      3) choose_discovered_tunnel "Choose managed tunnel" || continue; line="$CHOSEN_LINE"; source=$(line_get "$line" 0); id=$(line_get "$line" 1); [ "$source" = "managed" ] && "$INSTALL_PATH" --watchdog "$id" || echo "Not managed. Import first."; pause ;;
+      0) return 0 ;;
+      *) echo "Invalid choice."; pause ;;
+    esac
+  done
+}
+
+main_menu() {
+  require_root; ensure_dirs
+  while true; do
+    menu_header
+    echo "0) GRE pre-check between two servers"
+    echo "1) Create/setup a GRE tunnel"
+    echo "2) Delete/remove a tunnel"
+    echo "3) Edit a managed tunnel"
+    echo "4) View tunnel logs/status"
+    echo "5) Check tunnel health"
+    echo "6) Show detected tunnel details"
+    echo "7) Manage MSS clamp"
+    echo "8) Manage rp_filter"
+    echo "9) Manage watchdog"
+    echo "10) Install/update manager to $INSTALL_PATH"
+    echo "11) Discover/import existing GRE tunnels"
+    echo "q) Quit"
+    echo
+    read -r -p "Select: " choice
+    case "$choice" in
+      0) precheck_gre ;;
+      1) setup_tunnel ;;
+      2) delete_tunnel ;;
+      3) edit_tunnel ;;
+      4) logs_menu ;;
+      5) health_menu ;;
+      6) show_details_menu ;;
+      7) mss_menu ;;
+      8) rpfilter_menu ;;
+      9) watchdog_menu ;;
+      10) install_manager; pause ;;
+      11) import_discovered_tunnel ;;
+      q|Q) exit 0 ;;
+      *) echo "Invalid choice."; pause ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF2
+$APP_NAME v$APP_VERSION
+
+Usage:
+  gre-manager                 Interactive menu
+  gre-manager --install       Install/update to $INSTALL_PATH
+  gre-manager --up NAME       Bring managed tunnel up (used by systemd)
+  gre-manager --down NAME     Bring managed tunnel down (used by systemd)
+  gre-manager --watchdog NAME Watchdog check (used by systemd timer)
+  gre-manager --list          List managed tunnel names
+  gre-manager --discover      Show detected managed/runtime/legacy GRE tunnels
+EOF2
+}
+
+case "${1:-}" in
+  --install) install_manager ;;
+  --up) require_root; ensure_dirs; [ -n "${2:-}" ] || { err "Missing tunnel name."; exit 1; }; bring_up_tunnel "$2" ;;
+  --down) require_root; ensure_dirs; [ -n "${2:-}" ] || { err "Missing tunnel name."; exit 1; }; bring_down_tunnel "$2" ;;
+  --watchdog) require_root; ensure_dirs; [ -n "${2:-}" ] || { err "Missing tunnel name."; exit 1; }; watchdog_check "$2" ;;
+  --list) list_managed_tunnels ;;
+  --discover) require_root; ensure_dirs; show_discovery_table ;;
+  -h|--help) usage ;;
+  "")
+    if is_root && [ "${BASH_SOURCE[0]}" != "$INSTALL_PATH" ] && [ -r "${BASH_SOURCE[0]}" ]; then mkdir -p "$(dirname "$INSTALL_PATH")"; cp "${BASH_SOURCE[0]}" "$INSTALL_PATH" 2>/dev/null && chmod +x "$INSTALL_PATH" 2>/dev/null || true; fi
+    main_menu
+    ;;
+  *) usage; exit 1 ;;
+esac
