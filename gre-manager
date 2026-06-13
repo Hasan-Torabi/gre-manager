@@ -5,7 +5,7 @@
 set -u
 
 APP_NAME="GRE Tunnel Manager"
-APP_VERSION="1.2.4"
+APP_VERSION="1.2.5"
 INSTALL_PATH="/usr/local/bin/gre-manager"
 REMOTE_INSTALL_URL="https://raw.githubusercontent.com/Hasan-Torabi/gre-manager/main/gre-manager"
 CONFIG_DIR="/etc/gre-manager/tunnels"
@@ -804,20 +804,26 @@ self_update_manager() {
   ensure_dirs
 
   local url="${GRE_MANAGER_URL:-$REMOTE_INSTALL_URL}"
+  local download_url="$url"
   local tmp
   tmp="$(mktemp)"
+
+  # Avoid stale CDN/cache when updating from GitHub raw.
+  if [[ "$download_url" == *"raw.githubusercontent.com"* && "$download_url" != *"?"* ]]; then
+    download_url="${download_url}?$(date +%s)"
+  fi
 
   msg "Updating gre-manager from: $url"
 
   if command_exists curl; then
-    if ! curl -fsSL "$url" -o "$tmp"; then
+    if ! curl -fsSL "$download_url" -o "$tmp"; then
       rm -f "$tmp"
       err "Update failed: could not download the script."
       err "Check internet access and make sure REMOTE_INSTALL_URL points to the raw GitHub file."
       return 1
     fi
   elif command_exists wget; then
-    if ! wget -q "$url" -O "$tmp"; then
+    if ! wget -q "$download_url" -O "$tmp"; then
       rm -f "$tmp"
       err "Update failed: could not download the script."
       err "Check internet access and make sure REMOTE_INSTALL_URL points to the raw GitHub file."
@@ -829,7 +835,7 @@ self_update_manager() {
     return 1
   fi
 
-  if grep -qi '<!DOCTYPE html\|<html' "$tmp"; then
+  if head -n 5 "$tmp" | grep -qiE '^[[:space:]]*<!DOCTYPE html|^[[:space:]]*<html'; then
     rm -f "$tmp"
     err "Update failed: downloaded HTML instead of the raw bash script."
     err "Use raw.githubusercontent.com URL, not github.com/.../blob/..."
@@ -839,6 +845,12 @@ self_update_manager() {
   if ! head -n 1 "$tmp" | grep -qE '^#!.*(bash|sh)'; then
     rm -f "$tmp"
     err "Update failed: downloaded file does not look like a shell script."
+    return 1
+  fi
+
+  if ! grep -q '^APP_VERSION=' "$tmp"; then
+    rm -f "$tmp"
+    err "Update failed: downloaded script does not contain APP_VERSION."
     return 1
   fi
 
