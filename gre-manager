@@ -5,7 +5,7 @@
 set -u
 
 APP_NAME="GRE Tunnel Manager"
-APP_VERSION="1.2.5"
+APP_VERSION="1.2.7"
 INSTALL_PATH="/usr/local/bin/gre-manager"
 REMOTE_INSTALL_URL="https://raw.githubusercontent.com/Hasan-Torabi/gre-manager/main/gre-manager"
 CONFIG_DIR="/etc/gre-manager/tunnels"
@@ -15,6 +15,8 @@ DEFAULT_MTU="1300"
 DEFAULT_TEST_SUBNET_PREFIX="10.254.254"
 DEFAULT_TEST_KEY="654321"
 DEFAULT_WATCHDOG_INTERVAL="3min"
+DEFAULT_PRECHECK_WAIT_SECONDS="180"
+DEFAULT_PRECHECK_HOLD_SECONDS="45"
 
 # ---------- Basic helpers ----------
 
@@ -890,23 +892,42 @@ precheck_gre() {
   echo "Run this option on BOTH servers. Use the same test key and test subnet prefix on both sides."
   echo "IMPORTANT: choose a different test tunnel IP side on each server."
   echo "Example: server A = .1/30, server B = .2/30"
-  echo "This creates a temporary GRE interface, tests ping, then automatically removes grecheck and tunnelcheck artifacts."
+  echo
+  echo "How this test works now:"
+  echo "  1) Start option 0 on the first server."
+  echo "  2) It creates grecheck and waits automatically."
+  echo "  3) Start option 0 on the peer server and choose the opposite side."
+  echo "  4) Both servers keep checking ping during the wait window."
+  echo "  5) When ping works, the interface stays UP for a short hold time."
+  echo "  6) Cleanup is automatic: grecheck and tunnelcheck are removed at the end."
+  echo
+  echo "You do NOT need to press Enter at the same time on both servers."
   echo
   echo "0) Back"
   read -r -p "Press Enter to continue or 0 to go back: " back
   [ "$back" = "0" ] && return 0
 
-  local peer local_ip key mtu prefix lname local_tun remote_tun side custom_default peer_default
+  local peer local_ip key mtu prefix lname local_tun remote_tun side custom_default peer_default wait_seconds hold_seconds
   peer=$(ask_ipv4 "Enter peer public IP")
   local_ip=$(ask_local_public_ip "$peer")
   if ! valid_ipv4 "$local_ip"; then
-    err "Internal error: local public IP detection returned an invalid value. Please update gre-manager or enter the IP manually."
+    err "Internal error: local public IP detection returned an invalid value."
+    err "Please enter the local public IP manually or update gre-manager."
     err "Returned value was: $local_ip"
     pause
     return 1
   fi
   key=$(ask_number "Enter temporary GRE key" "$DEFAULT_TEST_KEY"); while ! valid_key "$key"; do key=$(ask_number "Invalid key. Enter GRE key" "$DEFAULT_TEST_KEY"); done
   mtu=$(ask_number "Enter temporary MTU" "$DEFAULT_MTU"); while ! valid_mtu "$mtu"; do mtu=$(ask_number "Invalid MTU. Enter MTU 576-1476" "$DEFAULT_MTU"); done
+
+  wait_seconds=$(ask_number "Seconds to wait for peer side to become ready" "$DEFAULT_PRECHECK_WAIT_SECONDS")
+  while [ "$wait_seconds" -lt 10 ] || [ "$wait_seconds" -gt 900 ]; do
+    wait_seconds=$(ask_number "Enter wait seconds between 10 and 900" "$DEFAULT_PRECHECK_WAIT_SECONDS")
+  done
+  hold_seconds=$(ask_number "Seconds to keep test interface UP after success" "$DEFAULT_PRECHECK_HOLD_SECONDS")
+  while [ "$hold_seconds" -lt 5 ] || [ "$hold_seconds" -gt 300 ]; do
+    hold_seconds=$(ask_number "Enter hold seconds between 5 and 300" "$DEFAULT_PRECHECK_HOLD_SECONDS")
+  done
 
   while true; do
     read -r -p "Enter test subnet prefix without .1/.2 [$DEFAULT_TEST_SUBNET_PREFIX]: " prefix
@@ -940,29 +961,87 @@ precheck_gre() {
   done
 
   lname="grecheck"
-  echo; echo "Temporary test settings:"; echo "  Local public:  $local_ip"; echo "  Peer public:   $peer"; echo "  Interface:     $lname"; echo "  Key:           $key"; echo "  Local tunnel:  $local_tun"; echo "  Peer tunnel:   $remote_tun"; echo "  MTU:           $mtu"; echo
-  echo "Now run option 0 on the peer server with the same key/subnet, but choose the opposite tunnel IP side."
-  read -r -p "Ready? Press Enter to create and test..." _
+  echo
+  echo "Temporary test settings:"
+  echo "  Local public:  $local_ip"
+  echo "  Peer public:   $peer"
+  echo "  Interface:     $lname"
+  echo "  Key:           $key"
+  echo "  Local tunnel:  $local_tun"
+  echo "  Peer tunnel:   $remote_tun"
+  echo "  MTU:           $mtu"
+  echo "  Wait time:     ${wait_seconds}s"
+  echo "  Hold time:     ${hold_seconds}s"
+  echo
+  echo "IMPORTANT: Start this same option on the peer server with the SAME key/subnet,"
+  echo "but choose the opposite tunnel IP side. This side will wait automatically."
+  echo
+  read -r -p "Press Enter to create grecheck on THIS server and start auto-wait..." _
 
   echo "Cleaning old temporary test interfaces first: grecheck, tunnelcheck"
   cleanup_precheck_artifacts "$peer"
 
   modprobe ip_gre 2>/dev/null || true
-  ip tunnel add "$lname" mode gre local "$local_ip" remote "$peer" key "$key" ttl 255
-  ip addr add "$local_tun" dev "$lname"
-  ip link set "$lname" mtu "$mtu"
-  ip link set "$lname" up
+  if ! ip tunnel add "$lname" mode gre local "$local_ip" remote "$peer" key "$key" ttl 255; then
+    err "Failed to create temporary GRE interface."
+    cleanup_precheck_artifacts "$peer"
+    pause
+    return 1
+  fi
+  if ! ip addr add "$local_tun" dev "$lname"; then
+    err "Failed to assign temporary tunnel IP."
+    cleanup_precheck_artifacts "$peer"
+    pause
+    return 1
+  fi
+  ip link set "$lname" mtu "$mtu" || true
+  ip link set "$lname" up || true
   sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
   sysctl -w "net.ipv4.conf.$lname.rp_filter=0" >/dev/null 2>&1 || true
   sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
   add_gre_firewall_rules "$lname" "$peer"
-  echo; echo "Interface created:"; ip tunnel show "$lname" || true; ip addr show "$lname" || true
-  echo; echo "Testing ping to $remote_tun ..."
-  if ping -I "$lname" -c 5 -W 1 "$remote_tun"; then
-    echo; echo "RESULT: GRE basic connectivity looks OK."
+
+  echo
+  echo "Interface created and kept UP:"
+  ip tunnel show "$lname" || true
+  ip addr show "$lname" || true
+  echo
+  echo "Auto-wait started. Now start option 0 on the peer server if you have not already done it."
+  echo "This side will try ping every 3 seconds for up to ${wait_seconds} seconds."
+  echo
+
+  local elapsed=0 interval=3 ok=0
+  while [ "$elapsed" -le "$wait_seconds" ]; do
+    if ping -I "$lname" -c 1 -W 1 "$remote_tun" >/dev/null 2>&1; then
+      ok=1
+      break
+    fi
+    printf 'Waiting for peer... %ss/%ss\r' "$elapsed" "$wait_seconds"
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
+  echo
+
+  if [ "$ok" -eq 1 ]; then
+    echo "Peer replied. Running final ping test to $remote_tun ..."
+    if ping -I "$lname" -c 5 -W 1 "$remote_tun"; then
+      echo
+      echo "RESULT: GRE basic connectivity looks OK."
+    else
+      echo
+      echo "RESULT: Peer replied once, but final ping was weak/failed."
+      echo "Possible causes: packet loss, provider filtering, firewall, rp_filter, or unstable route."
+    fi
+    echo
+    echo "Keeping $lname UP for ${hold_seconds} seconds so the peer side can also finish its test..."
+    sleep "$hold_seconds"
   else
-    echo; echo "RESULT: Ping failed."
-    echo "Possible causes: peer side not ready, both sides used the same test tunnel IP, GRE/protocol 47 blocked, wrong public IP, wrong key, firewall, rp_filter, or provider filtering."
+    echo "RESULT: Ping failed. Peer did not reply within ${wait_seconds} seconds."
+    echo "Make sure the peer side is running option 0 at the same time, with the same key/subnet and the opposite tunnel IP side."
+    echo "Other possible causes: GRE/protocol 47 blocked, wrong public IP, wrong key, firewall, rp_filter, or provider filtering."
+    echo
+    echo "Keeping $lname UP for 10 more seconds before cleanup..."
+    sleep 10
   fi
 
   echo
