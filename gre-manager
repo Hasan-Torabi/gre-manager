@@ -5,7 +5,7 @@
 set -u
 
 APP_NAME="GRE Tunnel Manager"
-APP_VERSION="1.2.3"
+APP_VERSION="1.2.4"
 INSTALL_PATH="/usr/local/bin/gre-manager"
 REMOTE_INSTALL_URL="https://raw.githubusercontent.com/Hasan-Torabi/gre-manager/main/gre-manager"
 CONFIG_DIR="/etc/gre-manager/tunnels"
@@ -131,7 +131,7 @@ ask_ipv4() {
   while true; do
     if [ -n "$default" ]; then read -r -p "$prompt [$default]: " value; value="${value:-$default}"; else read -r -p "$prompt: " value; fi
     if valid_ipv4 "$value"; then echo "$value"; return 0; fi
-    echo "Invalid IPv4 address. Example: 194.32.213.30"
+    echo "Invalid IPv4 address. Example: 192.0.2.10" >&2
   done
 }
 
@@ -140,7 +140,7 @@ ask_ipv4_cidr() {
   while true; do
     if [ -n "$default" ]; then read -r -p "$prompt [$default]: " value; value="${value:-$default}"; else read -r -p "$prompt: " value; fi
     if valid_ipv4_cidr "$value"; then echo "$value"; return 0; fi
-    echo "Invalid CIDR. Example: 10.80.0.2/30"
+    echo "Invalid CIDR. Example: 10.80.0.2/30" >&2
   done
 }
 
@@ -149,12 +149,16 @@ ask_number() {
   while true; do
     if [ -n "$default" ]; then read -r -p "$prompt [$default]: " value; value="${value:-$default}"; else read -r -p "$prompt: " value; fi
     [[ "$value" =~ ^[0-9]+$ ]] && { echo "$value"; return 0; }
-    echo "Please enter a number."
+    echo "Please enter a number." >&2
   done
 }
 
 ask_local_public_ip() {
-  local peer="${1:-}" detected="" value count choice
+  # IMPORTANT:
+  # This function is often used like: local_ip=$(ask_local_public_ip "$peer")
+  # Therefore every human-readable message must go to stderr, and only the final IP
+  # must be printed to stdout.
+  local peer="${1:-}" detected="" value count choice manual
   local -a ips
 
   [ -n "$peer" ] && detected=$(get_route_src_ip "$peer" || true)
@@ -164,28 +168,47 @@ ask_local_public_ip() {
   mapfile -t ips < <(list_local_global_ips)
   count="${#ips[@]}"
 
-  echo
-  echo "Local IP detection:"
-  [ -n "$detected" ] && echo "  Detected candidate: $detected" || echo "  Detected candidate: not found"
+  echo >&2
+  echo "Local IP detection:" >&2
+  [ -n "$detected" ] && echo "  Detected candidate: $detected" >&2 || echo "  Detected candidate: not found" >&2
   if [ "$count" -gt 0 ]; then
-    echo "  Local interface IPv4 addresses:"
+    echo "  Local interface IPv4 addresses:" >&2
     local i=1
-    for value in "${ips[@]}"; do echo "    $i) $value"; i=$((i+1)); done
+    for value in "${ips[@]}"; do echo "    $i) $value" >&2; i=$((i+1)); done
   fi
 
-  if [ -n "$detected" ] && confirm "Use $detected as this server public IP?" "y"; then echo "$detected"; return 0; fi
+  if [ -n "$detected" ]; then
+    if confirm "Use $detected as this server public IP?" "y"; then
+      echo "$detected"
+      return 0
+    fi
+  fi
 
   if [ "$count" -gt 1 ]; then
     while true; do
       read -r -p "Choose local IP number or press Enter to type manually: " choice
       [ -z "$choice" ] && break
-      if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then echo "${ips[$((choice-1))]}"; return 0; fi
-      echo "Invalid choice."
+      if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
+        echo "${ips[$((choice-1))]}"
+        return 0
+      fi
+      echo "Invalid choice." >&2
     done
   elif [ "$count" -eq 1 ]; then
-    if confirm "Use ${ips[0]} as this server public IP?" "y"; then echo "${ips[0]}"; return 0; fi
+    if confirm "Use ${ips[0]} as this server public IP?" "y"; then
+      echo "${ips[0]}"
+      return 0
+    fi
   fi
-  ask_ipv4 "Enter this server public IP"
+
+  while true; do
+    read -r -p "Enter this server public IP: " manual
+    if valid_ipv4 "$manual"; then
+      echo "$manual"
+      return 0
+    fi
+    echo "Invalid IPv4 address. Example: 192.0.2.10" >&2
+  done
 }
 
 # ---------- Config handling ----------
@@ -263,6 +286,30 @@ remove_gre_firewall_rules() {
   iptables_delete_all filter INPUT -p gre -s "$peer" -m comment --comment "gre-manager:$tun" -j ACCEPT || true
   iptables_delete_all filter OUTPUT -p gre -d "$peer" -m comment --comment "gre-manager:$tun" -j ACCEPT || true
 }
+
+cleanup_precheck_artifacts() {
+  # Clean all temporary GRE pre-check artifacts created by this manager or older test versions.
+  # We intentionally clean both grecheck and tunnelcheck, because older notes/scripts may use either name.
+  local peer="${1:-}" ifname svc timer
+  for ifname in grecheck tunnelcheck; do
+    ip link set "$ifname" down >/dev/null 2>&1 || true
+    ip tunnel del "$ifname" >/dev/null 2>&1 || true
+    remove_mss_clamp_rules "$ifname" >/dev/null 2>&1 || true
+    [ -n "$peer" ] && remove_gre_firewall_rules "$ifname" "$peer" >/dev/null 2>&1 || true
+  done
+
+  # Remove temporary systemd artifacts only if they exist with the known test names.
+  for svc in grecheck tunnelcheck gre-manager-grecheck gre-manager-tunnelcheck; do
+    systemctl disable --now "$svc.service" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$svc.service" >/dev/null 2>&1 || true
+  done
+  for timer in grecheck tunnelcheck gre-manager-grecheck gre-manager-tunnelcheck; do
+    systemctl disable --now "$timer.timer" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$timer.timer" >/dev/null 2>&1 || true
+  done
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 
 apply_mss_clamp_rules() {
   local tun="$1"
@@ -722,6 +769,13 @@ install_manager() {
     fi
   fi
 
+  if ! bash -n "$INSTALL_PATH" >/dev/null 2>&1; then
+    err "Install failed: downloaded/copied file is not a valid bash script."
+    err "Check that you are using the raw GitHub URL, not the /blob/ URL."
+    rm -f "$INSTALL_PATH"
+    return 1
+  fi
+
   chmod 755 "$INSTALL_PATH"
 
   if [ ! -x "$INSTALL_PATH" ]; then
@@ -729,12 +783,83 @@ install_manager() {
     return 1
   fi
 
+  # Some minimal VPS images do not include /usr/local/bin in non-login PATH.
+  # Add a fallback symlink in /usr/bin so the command works immediately.
+  if [ -d /usr/bin ]; then
+    ln -sf "$INSTALL_PATH" /usr/bin/gre-manager 2>/dev/null || true
+  fi
+
+  hash -r 2>/dev/null || true
+
   if ! command -v gre-manager >/dev/null 2>&1; then
     warn "$INSTALL_PATH installed, but gre-manager is not in PATH for this shell."
     warn "Run it with: $INSTALL_PATH"
   else
     msg "Installed successfully: $(command -v gre-manager)"
   fi
+}
+
+self_update_manager() {
+  require_root
+  ensure_dirs
+
+  local url="${GRE_MANAGER_URL:-$REMOTE_INSTALL_URL}"
+  local tmp
+  tmp="$(mktemp)"
+
+  msg "Updating gre-manager from: $url"
+
+  if command_exists curl; then
+    if ! curl -fsSL "$url" -o "$tmp"; then
+      rm -f "$tmp"
+      err "Update failed: could not download the script."
+      err "Check internet access and make sure REMOTE_INSTALL_URL points to the raw GitHub file."
+      return 1
+    fi
+  elif command_exists wget; then
+    if ! wget -q "$url" -O "$tmp"; then
+      rm -f "$tmp"
+      err "Update failed: could not download the script."
+      err "Check internet access and make sure REMOTE_INSTALL_URL points to the raw GitHub file."
+      return 1
+    fi
+  else
+    rm -f "$tmp"
+    err "Update failed: curl or wget is required."
+    return 1
+  fi
+
+  if grep -qi '<!DOCTYPE html\|<html' "$tmp"; then
+    rm -f "$tmp"
+    err "Update failed: downloaded HTML instead of the raw bash script."
+    err "Use raw.githubusercontent.com URL, not github.com/.../blob/..."
+    return 1
+  fi
+
+  if ! head -n 1 "$tmp" | grep -qE '^#!.*(bash|sh)'; then
+    rm -f "$tmp"
+    err "Update failed: downloaded file does not look like a shell script."
+    return 1
+  fi
+
+  if ! bash -n "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    err "Update failed: downloaded script has bash syntax errors."
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$INSTALL_PATH")"
+  cp "$tmp" "$INSTALL_PATH"
+  chmod 755 "$INSTALL_PATH"
+  rm -f "$tmp"
+
+  if [ -d /usr/bin ]; then
+    ln -sf "$INSTALL_PATH" /usr/bin/gre-manager 2>/dev/null || true
+  fi
+
+  hash -r 2>/dev/null || true
+  msg "Update completed."
+  "$INSTALL_PATH" --version || true
 }
 
 # ---------- Interactive functions ----------
@@ -753,7 +878,7 @@ precheck_gre() {
   echo "Run this option on BOTH servers. Use the same test key and test subnet prefix on both sides."
   echo "IMPORTANT: choose a different test tunnel IP side on each server."
   echo "Example: server A = .1/30, server B = .2/30"
-  echo "This creates a temporary GRE interface, tests ping, then removes it by default."
+  echo "This creates a temporary GRE interface, tests ping, then automatically removes grecheck and tunnelcheck artifacts."
   echo
   echo "0) Back"
   read -r -p "Press Enter to continue or 0 to go back: " back
@@ -762,6 +887,12 @@ precheck_gre() {
   local peer local_ip key mtu prefix lname local_tun remote_tun side custom_default peer_default
   peer=$(ask_ipv4 "Enter peer public IP")
   local_ip=$(ask_local_public_ip "$peer")
+  if ! valid_ipv4 "$local_ip"; then
+    err "Internal error: local public IP detection returned an invalid value. Please update gre-manager or enter the IP manually."
+    err "Returned value was: $local_ip"
+    pause
+    return 1
+  fi
   key=$(ask_number "Enter temporary GRE key" "$DEFAULT_TEST_KEY"); while ! valid_key "$key"; do key=$(ask_number "Invalid key. Enter GRE key" "$DEFAULT_TEST_KEY"); done
   mtu=$(ask_number "Enter temporary MTU" "$DEFAULT_MTU"); while ! valid_mtu "$mtu"; do mtu=$(ask_number "Invalid MTU. Enter MTU 576-1476" "$DEFAULT_MTU"); done
 
@@ -800,8 +931,11 @@ precheck_gre() {
   echo; echo "Temporary test settings:"; echo "  Local public:  $local_ip"; echo "  Peer public:   $peer"; echo "  Interface:     $lname"; echo "  Key:           $key"; echo "  Local tunnel:  $local_tun"; echo "  Peer tunnel:   $remote_tun"; echo "  MTU:           $mtu"; echo
   echo "Now run option 0 on the peer server with the same key/subnet, but choose the opposite tunnel IP side."
   read -r -p "Ready? Press Enter to create and test..." _
+
+  echo "Cleaning old temporary test interfaces first: grecheck, tunnelcheck"
+  cleanup_precheck_artifacts "$peer"
+
   modprobe ip_gre 2>/dev/null || true
-  ip tunnel del "$lname" 2>/dev/null || true
   ip tunnel add "$lname" mode gre local "$local_ip" remote "$peer" key "$key" ttl 255
   ip addr add "$local_tun" dev "$lname"
   ip link set "$lname" mtu "$mtu"
@@ -812,8 +946,17 @@ precheck_gre() {
   add_gre_firewall_rules "$lname" "$peer"
   echo; echo "Interface created:"; ip tunnel show "$lname" || true; ip addr show "$lname" || true
   echo; echo "Testing ping to $remote_tun ..."
-  if ping -I "$lname" -c 5 -W 1 "$remote_tun"; then echo; echo "RESULT: GRE basic connectivity looks OK."; else echo; echo "RESULT: Ping failed."; echo "Possible causes: peer side not ready, both sides used the same test tunnel IP, GRE/protocol 47 blocked, wrong public IP, wrong key, firewall, rp_filter, or provider filtering."; fi
-  if confirm "Remove temporary interface $lname now?" "y"; then ip link set "$lname" down 2>/dev/null || true; ip tunnel del "$lname" 2>/dev/null || true; remove_gre_firewall_rules "$lname" "$peer"; echo "Temporary interface removed."; else echo "Temporary interface kept. Remove later with: ip tunnel del $lname"; fi
+  if ping -I "$lname" -c 5 -W 1 "$remote_tun"; then
+    echo; echo "RESULT: GRE basic connectivity looks OK."
+  else
+    echo; echo "RESULT: Ping failed."
+    echo "Possible causes: peer side not ready, both sides used the same test tunnel IP, GRE/protocol 47 blocked, wrong public IP, wrong key, firewall, rp_filter, or provider filtering."
+  fi
+
+  echo
+  echo "Cleaning temporary test artifacts: grecheck and tunnelcheck"
+  cleanup_precheck_artifacts "$peer"
+  echo "Temporary test cleanup completed."
   pause
 }
 
@@ -1153,8 +1296,9 @@ main_menu() {
     echo "7) Manage MSS clamp"
     echo "8) Manage rp_filter"
     echo "9) Manage watchdog"
-    echo "10) Install/update manager to $INSTALL_PATH"
-    echo "11) Discover/import existing GRE tunnels"
+    echo "10) Install manager locally/global"
+    echo "11) Update manager from GitHub"
+    echo "12) Discover/import existing GRE tunnels"
     echo "q) Quit"
     echo
     read -r -p "Select: " choice
@@ -1170,7 +1314,8 @@ main_menu() {
       8) rpfilter_menu ;;
       9) watchdog_menu ;;
       10) install_manager; pause ;;
-      11) import_discovered_tunnel ;;
+      11) self_update_manager; pause ;;
+      12) import_discovered_tunnel ;;
       q|Q) exit 0 ;;
       *) echo "Invalid choice."; pause ;;
     esac
@@ -1183,7 +1328,8 @@ $APP_NAME v$APP_VERSION
 
 Usage:
   gre-manager                 Interactive menu
-  gre-manager --install       Install/update to $INSTALL_PATH
+  gre-manager --install       Install local/current script to $INSTALL_PATH
+  gre-manager --update        Download latest script from GitHub and replace $INSTALL_PATH
   gre-manager --version       Show version
   gre-manager --up NAME       Bring managed tunnel up (used by systemd)
   gre-manager --down NAME     Bring managed tunnel down (used by systemd)
@@ -1195,6 +1341,7 @@ EOF2
 
 case "${1:-}" in
   --install) install_manager ;;
+  --update) self_update_manager ;;
   --version) echo "$APP_NAME v$APP_VERSION" ;;
   --up) require_root; ensure_dirs; [ -n "${2:-}" ] || { err "Missing tunnel name."; exit 1; }; bring_up_tunnel "$2" ;;
   --down) require_root; ensure_dirs; [ -n "${2:-}" ] || { err "Missing tunnel name."; exit 1; }; bring_down_tunnel "$2" ;;
