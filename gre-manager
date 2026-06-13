@@ -5,8 +5,9 @@
 set -u
 
 APP_NAME="GRE Tunnel Manager"
-APP_VERSION="1.1.0"
+APP_VERSION="1.2.0"
 INSTALL_PATH="/usr/local/bin/gre-manager"
+REMOTE_INSTALL_URL="https://raw.githubusercontent.com/Hasan-Torabi/gre-manager/main/gre-manager"
 CONFIG_DIR="/etc/gre-manager/tunnels"
 LOG_DIR="/var/log/gre-manager"
 SERVICE_PREFIX="gre-manager"
@@ -683,10 +684,56 @@ disable_watchdog() {
 # ---------- Installation ----------
 
 install_manager() {
-  require_root; ensure_dirs
-  local src="${BASH_SOURCE[0]}"
-  if [ "$src" = "$INSTALL_PATH" ]; then msg "Already installed at $INSTALL_PATH"; else
-    if [ -r "$src" ]; then cp "$src" "$INSTALL_PATH"; chmod +x "$INSTALL_PATH"; msg "Installed to $INSTALL_PATH"; else err "Cannot read script source. Save this file first, then run: install -m 755 gre-manager.sh $INSTALL_PATH"; return 1; fi
+  require_root
+  ensure_dirs
+
+  local src="${BASH_SOURCE[0]:-$0}"
+  local url="${GRE_MANAGER_URL:-$REMOTE_INSTALL_URL}"
+  local tmp=""
+
+  mkdir -p "$(dirname "$INSTALL_PATH")"
+
+  if [ "$src" = "$INSTALL_PATH" ] || [ "$(readlink -f "$src" 2>/dev/null || true)" = "$(readlink -f "$INSTALL_PATH" 2>/dev/null || true)" ]; then
+    chmod +x "$INSTALL_PATH" 2>/dev/null || true
+    msg "Already installed at $INSTALL_PATH"
+    return 0
+  fi
+
+  # If the script is running from a real local file, copy it.
+  # If it is running from bash <(curl ...), /dev/fd/... is not safe to copy,
+  # so download the raw script URL instead.
+  if [ -f "$src" ] && [ -r "$src" ] && [[ "$src" != /dev/fd/* ]] && [[ "$src" != /proc/*/fd/* ]]; then
+    cp "$src" "$INSTALL_PATH"
+  else
+    if command_exists curl; then
+      tmp="$(mktemp)"
+      curl -fsSL "$url" -o "$tmp"
+      cp "$tmp" "$INSTALL_PATH"
+      rm -f "$tmp"
+    elif command_exists wget; then
+      tmp="$(mktemp)"
+      wget -q "$url" -O "$tmp"
+      cp "$tmp" "$INSTALL_PATH"
+      rm -f "$tmp"
+    else
+      err "Cannot install from process substitution because curl/wget is not available."
+      err "Manual install: download the raw script and run: install -m 755 gre-manager $INSTALL_PATH"
+      return 1
+    fi
+  fi
+
+  chmod 755 "$INSTALL_PATH"
+
+  if [ ! -x "$INSTALL_PATH" ]; then
+    err "Install failed: $INSTALL_PATH is not executable."
+    return 1
+  fi
+
+  if ! command -v gre-manager >/dev/null 2>&1; then
+    warn "$INSTALL_PATH installed, but gre-manager is not in PATH for this shell."
+    warn "Run it with: $INSTALL_PATH"
+  else
+    msg "Installed successfully: $(command -v gre-manager)"
   fi
 }
 
@@ -704,24 +751,54 @@ precheck_gre() {
   echo "GRE pre-check"
   echo
   echo "Run this option on BOTH servers. Use the same test key and test subnet prefix on both sides."
+  echo "IMPORTANT: choose a different test tunnel IP side on each server."
+  echo "Example: server A = .1/30, server B = .2/30"
   echo "This creates a temporary GRE interface, tests ping, then removes it by default."
   echo
   echo "0) Back"
   read -r -p "Press Enter to continue or 0 to go back: " back
   [ "$back" = "0" ] && return 0
-  local peer local_ip key mtu prefix lname local_int peer_int local_tun remote_tun
+
+  local peer local_ip key mtu prefix lname local_tun remote_tun side custom_default peer_default
   peer=$(ask_ipv4 "Enter peer public IP")
   local_ip=$(ask_local_public_ip "$peer")
   key=$(ask_number "Enter temporary GRE key" "$DEFAULT_TEST_KEY"); while ! valid_key "$key"; do key=$(ask_number "Invalid key. Enter GRE key" "$DEFAULT_TEST_KEY"); done
   mtu=$(ask_number "Enter temporary MTU" "$DEFAULT_MTU"); while ! valid_mtu "$mtu"; do mtu=$(ask_number "Invalid MTU. Enter MTU 576-1476" "$DEFAULT_MTU"); done
-  read -r -p "Enter test subnet prefix without .1/.2 [$DEFAULT_TEST_SUBNET_PREFIX]: " prefix
-  prefix="${prefix:-$DEFAULT_TEST_SUBNET_PREFIX}"
-  if ! [[ "$prefix" =~ ^([0-9]{1,3}\.){2}[0-9]{1,3}$ ]]; then warn "Invalid prefix. Using $DEFAULT_TEST_SUBNET_PREFIX"; prefix="$DEFAULT_TEST_SUBNET_PREFIX"; fi
-  local_int=$(ip_to_int "$local_ip"); peer_int=$(ip_to_int "$peer")
-  if [ "$local_int" -lt "$peer_int" ]; then local_tun="$prefix.1/30"; remote_tun="$prefix.2"; else local_tun="$prefix.2/30"; remote_tun="$prefix.1"; fi
+
+  while true; do
+    read -r -p "Enter test subnet prefix without .1/.2 [$DEFAULT_TEST_SUBNET_PREFIX]: " prefix
+    prefix="${prefix:-$DEFAULT_TEST_SUBNET_PREFIX}"
+    if [[ "$prefix" =~ ^([0-9]{1,3}\.){2}[0-9]{1,3}$ ]] && valid_ipv4 "$prefix.1" && valid_ipv4 "$prefix.2"; then
+      break
+    fi
+    echo "Invalid prefix. Example: 10.254.254"
+  done
+
+  echo
+  echo "Choose THIS server test tunnel IP:"
+  echo "  1) Use $prefix.1/30 on this server, peer will use $prefix.2"
+  echo "  2) Use $prefix.2/30 on this server, peer will use $prefix.1"
+  echo "  3) Custom tunnel IPs"
+  echo
+  echo "On the peer server, choose the opposite option."
+  while true; do
+    read -r -p "Select [1/2/3]: " side
+    case "$side" in
+      1) local_tun="$prefix.1/30"; remote_tun="$prefix.2"; break ;;
+      2) local_tun="$prefix.2/30"; remote_tun="$prefix.1"; break ;;
+      3)
+        custom_default="$prefix.1/30"
+        local_tun=$(ask_ipv4_cidr "Enter THIS server temporary tunnel IP/CIDR" "$custom_default")
+        peer_default=$(peer_from_30 "$local_tun" 2>/dev/null || true)
+        remote_tun=$(ask_ipv4 "Enter PEER temporary tunnel IP without CIDR" "$peer_default")
+        break ;;
+      *) echo "Invalid choice. Choose 1, 2, or 3." ;;
+    esac
+  done
+
   lname="grecheck"
   echo; echo "Temporary test settings:"; echo "  Local public:  $local_ip"; echo "  Peer public:   $peer"; echo "  Interface:     $lname"; echo "  Key:           $key"; echo "  Local tunnel:  $local_tun"; echo "  Peer tunnel:   $remote_tun"; echo "  MTU:           $mtu"; echo
-  echo "Now run option 0 on the peer server with the same key/subnet, then press Enter here."
+  echo "Now run option 0 on the peer server with the same key/subnet, but choose the opposite tunnel IP side."
   read -r -p "Ready? Press Enter to create and test..." _
   modprobe ip_gre 2>/dev/null || true
   ip tunnel del "$lname" 2>/dev/null || true
@@ -735,7 +812,7 @@ precheck_gre() {
   add_gre_firewall_rules "$lname" "$peer"
   echo; echo "Interface created:"; ip tunnel show "$lname" || true; ip addr show "$lname" || true
   echo; echo "Testing ping to $remote_tun ..."
-  if ping -I "$lname" -c 5 -W 1 "$remote_tun"; then echo; echo "RESULT: GRE basic connectivity looks OK."; else echo; echo "RESULT: Ping failed."; echo "Possible causes: peer side not ready, GRE/protocol 47 blocked, wrong public IP, wrong key, firewall, rp_filter, or provider filtering."; fi
+  if ping -I "$lname" -c 5 -W 1 "$remote_tun"; then echo; echo "RESULT: GRE basic connectivity looks OK."; else echo; echo "RESULT: Ping failed."; echo "Possible causes: peer side not ready, both sides used the same test tunnel IP, GRE/protocol 47 blocked, wrong public IP, wrong key, firewall, rp_filter, or provider filtering."; fi
   if confirm "Remove temporary interface $lname now?" "y"; then ip link set "$lname" down 2>/dev/null || true; ip tunnel del "$lname" 2>/dev/null || true; remove_gre_firewall_rules "$lname" "$peer"; echo "Temporary interface removed."; else echo "Temporary interface kept. Remove later with: ip tunnel del $lname"; fi
   pause
 }
@@ -1107,6 +1184,7 @@ $APP_NAME v$APP_VERSION
 Usage:
   gre-manager                 Interactive menu
   gre-manager --install       Install/update to $INSTALL_PATH
+  gre-manager --version       Show version
   gre-manager --up NAME       Bring managed tunnel up (used by systemd)
   gre-manager --down NAME     Bring managed tunnel down (used by systemd)
   gre-manager --watchdog NAME Watchdog check (used by systemd timer)
@@ -1117,6 +1195,7 @@ EOF2
 
 case "${1:-}" in
   --install) install_manager ;;
+  --version) echo "$APP_NAME v$APP_VERSION" ;;
   --up) require_root; ensure_dirs; [ -n "${2:-}" ] || { err "Missing tunnel name."; exit 1; }; bring_up_tunnel "$2" ;;
   --down) require_root; ensure_dirs; [ -n "${2:-}" ] || { err "Missing tunnel name."; exit 1; }; bring_down_tunnel "$2" ;;
   --watchdog) require_root; ensure_dirs; [ -n "${2:-}" ] || { err "Missing tunnel name."; exit 1; }; watchdog_check "$2" ;;
@@ -1124,7 +1203,9 @@ case "${1:-}" in
   --discover) require_root; ensure_dirs; show_discovery_table ;;
   -h|--help) usage ;;
   "")
-    if is_root && [ "${BASH_SOURCE[0]}" != "$INSTALL_PATH" ] && [ -r "${BASH_SOURCE[0]}" ]; then mkdir -p "$(dirname "$INSTALL_PATH")"; cp "${BASH_SOURCE[0]}" "$INSTALL_PATH" 2>/dev/null && chmod +x "$INSTALL_PATH" 2>/dev/null || true; fi
+    if is_root && [ "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)" != "$(readlink -f "$INSTALL_PATH" 2>/dev/null || true)" ]; then
+      install_manager >/dev/null 2>&1 || warn "Auto-install failed. You can still use this session, or run: gre-manager --install"
+    fi
     main_menu
     ;;
   *) usage; exit 1 ;;
