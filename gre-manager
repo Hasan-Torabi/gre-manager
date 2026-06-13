@@ -5,7 +5,7 @@
 set -u
 
 APP_NAME="GRE Tunnel Manager"
-APP_VERSION="1.2.0"
+APP_VERSION="1.2.3"
 INSTALL_PATH="/usr/local/bin/gre-manager"
 REMOTE_INSTALL_URL="https://raw.githubusercontent.com/Hasan-Torabi/gre-manager/main/gre-manager"
 CONFIG_DIR="/etc/gre-manager/tunnels"
